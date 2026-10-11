@@ -50,3 +50,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
       - run: cargo test
+
+  dprint:
+    runs-on: ubicloud
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check formatting with dprint
+        uses: dprint/check@v2.3
