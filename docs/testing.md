@@ -90,14 +90,18 @@ bin="$PWD/target/debug/devbox-mcp"
 work="$(mktemp -d)"
 cfg="$(printf '{"mcpServers":{"devbox":{"command":"%s","args":["--workdir-root","%s"]}}}' "$bin" "$work")"
 (cd "$work" && claude -p --mcp-config "$cfg" --strict-mcp-config \
-    --allowedTools mcp__devbox__run_turn \
+    --tools '' --allowedTools mcp__devbox__run_turn -- \
     "Use the devbox run_turn tool to ask the remote agent to say hello world. \
-     Then report exactly what the tool returned (all fields), and nothing else.")
+     Then report exactly what the tool returned (all fields), and nothing else." < /dev/null)
 ```
 
 Running from the scratch directory keeps this repository's instructions out of the client's context, and
-`--strict-mcp-config` keeps any other configured MCP servers out of the test. `--allowedTools` should list exactly the
-devbox tools the scenario needs (as `mcp__devbox__<tool>`), so the client cannot do the work with its own tools instead.
+`--strict-mcp-config` keeps any other configured MCP servers out of the test. `--tools ''` removes Claude Code's
+built-in tools (shell, file editing, and so on), so the client cannot do the work itself instead of through devbox-mcp.
+`--allowedTools` is a different thing: it grants permission to use the listed tools without asking, which print mode
+needs because nobody is there to approve a call. List exactly the devbox tools the scenario needs, as
+`mcp__devbox__<tool>`. Both options take a variable number of values, so `--` is needed before the prompt, or the prompt
+is swallowed as one more tool name.
 
 This talks stdio directly, without tunnel-client, so it says nothing about deadlines or serialization; combine it with
 layer 2's tunnel mode for those. It is also not the same client as a ChatGPT Dot, which may present tools,
