@@ -3,6 +3,18 @@
 This project is either public now, or may become public in the future. No content in this project should contain
 personal information such as personal usernames, hostnames, details about the local environments, etc.
 
+## Specification
+
+[SPEC.md](SPEC.md) specifies what devbox-mcp does; [SPEC_impl.md](SPEC_impl.md) specifies how it is built. All work must
+adhere to both. Code that disagrees with SPEC.md is a bug. If a task needs SPEC.md to change, say so and get the user's
+agreement before changing it. Keep SPEC_impl.md, including its implementation status, in sync with the code in the same
+change.
+
+The security model in SPEC.md (the `SEC-*` requirements, and the rules in SPEC_impl.md that enforce them) is a hard
+requirement. Never weaken it, work around it, or reinterpret it, for instance by opening a port or socket, adding a
+listener-capable dependency feature, or adding another way into the box, without extremely explicit confirmation from
+the user for that specific change. This applies to tests, debugging aids, and temporary changes too.
+
 ## Before finishing work
 
 Run the same checks CI runs, with the same arguments, and make sure they all pass:
