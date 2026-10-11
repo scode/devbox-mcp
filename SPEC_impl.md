@@ -34,6 +34,12 @@ from tunnel-client's source at commit `b91e6c9`, 2026-10-09; recheck it on upgra
 and no IPC, because running turns are not required to survive the process (`LIF-1`). Conversely, when the child exits on
 its own, tunnel-client asks for its own shutdown, so a crashing devbox-mcp takes tunnel-client down with it.
 
+tunnel-client forwards requests to its stdio child one at a time, and gives up on a response after a deadline (its local
+dev proxy defaults to 30 seconds; what the hosted relay applies has not been checked). Observed with tunnel-client
+v0.0.16: a tool call that outlives the deadline fails on the client side while devbox-mcp keeps working on it, and every
+other call queued behind it times out too. So every tool call must return quickly no matter how long the agent works,
+which is the practical reason behind `TRN-1` and `BND-1`, and long-polling reads must wait well under the deadline.
+
 tunnel-client stops its child by closing the child's stdin and sending it SIGTERM. devbox-mcp therefore treats stdin
 reaching end of file, SIGTERM, and SIGINT alike as a request for an orderly shutdown: it returns from `main`, which
 drops the tokio runtime and with it every in-flight tool call, and dropping a call kills its agent.
@@ -98,6 +104,13 @@ turns.
 
 ## Testing
 
-Automated tests use only injected paths and fake agents, never the user's real state or a real model, and drive the real
-binary over stdio. Running real agents is a manual step, with a driver for direct tool calls and a recipe for putting a
-real model in front of devbox-mcp. [docs/testing.md](docs/testing.md) describes all of it.
+Automated tests use only injected paths and fake agents, never the user's real state or a real model. They drive the
+real binary both over plain stdio and through the real tunnel-client, using its local `dev proxy` mode, which runs
+tunnel-client's runtime against an in-memory control plane and needs no credentials. The tunnel-client release is pinned
+by version and checksum in `scripts/install-tunnel-client.sh`. Running real agents is a manual step, with a driver for
+direct tool calls (optionally through the dev proxy) and a recipe for putting a real model in front of devbox-mcp.
+[docs/testing.md](docs/testing.md) describes all of it.
+
+`SEC-2` constrains devbox-mcp, not local development tooling. Test harnesses and manual test setups may listen for
+connections as long as they listen only locally: on loopback addresses or on Unix sockets in private temporary
+directories. devbox-mcp itself never listens, in tests or anywhere else.

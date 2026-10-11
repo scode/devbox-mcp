@@ -17,6 +17,11 @@ serde_json = "1"
 tokio = { version = "1.53.2", features = ["macros", "rt", "process", "io-util", "io-std", "signal"] }
 
 [dev-dependencies]
-# The client side is only for tests and the manual driver in examples/.
-rmcp = { version = "3.5.1", default-features = false, features = ["client", "transport-child-process"] }
+# The client side is only for tests and the manual driver in examples/. The Unix-socket HTTP client reaches
+# tunnel-client's local dev proxy; it is a client, so it does not conflict with SEC-2.
+rmcp = { version = "3.5.1", default-features = false, features = [
+  "client",
+  "transport-child-process",
+  "transport-streamable-http-client-unix-socket",
+] }
 tempfile = "3.27.0"
