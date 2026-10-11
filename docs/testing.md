@@ -30,19 +30,25 @@ cargo test
   real Codex run.
 - `tests/stdio.rs` starts the real devbox-mcp binary and plays tunnel-client's role over stdio, with a fake Codex (a
   short shell script) in place of the real one. The fake records how it was invoked, so tests can check the exact
-  command line, stdin, and working directory, and it can simulate failed and hanging turns.
+  command line, stdin, and working directory. It can also simulate failed and hanging turns, background leftovers, and
+  noisy startup. Its hanging turn mirrors how real Codex runs shell commands, in a new session that a process group kill
+  would miss; `tests/support/mod.rs` lists all the behaviors.
 - `tests/tunnel.rs` repeats the important paths with the real tunnel-client in between, via `dev proxy`: a turn through
   its real request path, and its real way of stopping devbox-mcp. No test yet covers its one-at-a-time forwarding or its
   response deadline (see SPEC_impl.md, "Process model"); the prototype's blocking `run_turn` would simply fail such a
   test. Once turns run in the background, add one that checks a running turn does not hold up other calls.
 
-The shutdown tests in both files are worth knowing about. They check that when tunnel-client stops (SIGTERM plus closing
-devbox-mcp's stdin) or dies (stdin closing alone), devbox-mcp exits cleanly and kills the agent's whole process group.
+The shutdown and cancellation tests are worth knowing about. They check that devbox-mcp exits cleanly and kills the
+agent's whole process tree, across sessions, in every way it can be stopped: tunnel-client stopping it (SIGTERM plus
+closing its stdin), tunnel-client dying (stdin closing alone), SIGTERM alone with stdin still open, SIGTERM during MCP
+initialization, and the client cancelling the call.
 
 Rules for these tests, all of which keep them hermetic: no real agents and no network; every path (working directories,
-the agent executable) is injected through devbox-mcp's command-line flags into a temporary directory; and no test
-modifies the environment variables of the test process. Test tooling may listen locally (the dev proxy listens on a Unix
-socket in the test's temporary directory); devbox-mcp itself never does.
+the agent executable) is injected through devbox-mcp's command-line flags into a temporary directory; child processes
+get an explicit environment (only `PATH`, and a `HOME` in the temporary directory) so a developer's real configuration,
+such as tunnel-client settings, cannot leak in; and no test modifies the environment variables of the test process. Test
+tooling may listen locally (the dev proxy listens on a Unix socket in the test's temporary directory); devbox-mcp itself
+never does.
 
 ## 2. Manual driver
 
@@ -60,7 +66,9 @@ Add `--via-tunnel-client` to route the calls through tunnel-client's dev proxy i
 is the closest local equivalent of production, and the mode to use whenever timing or the number of calls matters:
 tunnel-client forwards requests to devbox-mcp one at a time and gives up on a response after a deadline (30 seconds by
 default here, adjustable with `--response-timeout-secs`), so a slow call blocks every other call behind it. The stdio
-mode hides both effects.
+mode hides both effects. In tunnel mode, tunnel-client (and so devbox-mcp and the agent) gets only an allowlisted part
+of your environment, enough for the agent to find its tools and its login, so your own tunnel-client configuration
+cannot leak in; see `AGENT_ENV_ALLOWLIST` in the driver if an agent needs more.
 
 Always pass `--workdir-root` pointing at a scratch directory, so manual turns do not run in the default
 `~/devbox-mcp/work`. Several `TOOL JSON` pairs on one command line run in order against the same server process; use

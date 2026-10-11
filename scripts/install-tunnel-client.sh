@@ -37,7 +37,8 @@ Darwin-arm64)
 esac
 
 root=$(cd "$(dirname "$0")/.." && pwd)
-dest="$root/target/tools/tunnel-client-$version"
+# The platform is part of the path so a checkout or cache shared between architectures never reuses the wrong binary.
+dest="$root/target/tools/tunnel-client-$version-$platform"
 link_dir="$root/target/tools/bin"
 
 link_and_report() {

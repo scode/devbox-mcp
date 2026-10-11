@@ -13,13 +13,17 @@ use rmcp::model::CallToolRequestParams;
 use rmcp::service::{RoleClient, RunningService};
 use rmcp::transport::TokioChildProcess;
 use serde_json::{Value, json};
-use support::{DEVBOX_MCP, Harness, assert_all_gone, run_turn, send_signal, structured};
+use support::{
+    DEVBOX_MCP, Harness, assert_all_gone, hermetic_env, run_turn, send_signal, structured,
+};
 use tokio::process::Command;
 
 /// Starts devbox-mcp on this harness and completes MCP initialization with it over stdio.
 async fn connect(h: &Harness) -> RunningService<RoleClient, ()> {
     let mut cmd = Command::new(DEVBOX_MCP);
-    cmd.args(h.devbox_args());
+    cmd.env_clear()
+        .envs(hermetic_env(h.tmp.path()))
+        .args(h.devbox_args());
     ().serve(TokioChildProcess::new(cmd).unwrap())
         .await
         .unwrap()
@@ -126,81 +130,173 @@ async fn rejects_relative_workdir() {
     client.cancel().await.unwrap();
 }
 
-/// A devbox-mcp process driven over raw JSON-RPC, with a turn hanging in the fake agent.
-///
-/// The shutdown tests bypass rmcp's client because they need exact control over the two signals tunnel-client can send
-/// its child (closing stdin, and SIGTERM). rmcp's client transport neither exposes the server's stdin nor reliably
-/// closes it on shutdown; it falls back to SIGKILL, which is not what tunnel-client does.
-struct HangingTurn {
-    server: tokio::process::Child,
-    stdin: Option<tokio::process::ChildStdin>,
-    /// PIDs of the fake agent and of the background command it started.
-    agent_pids: Vec<i32>,
+/// Spec (`TRN-*`, robustness): a large prompt is delivered even when the agent writes a lot of output before reading
+/// its input. If devbox-mcp wrote the whole prompt before draining output, both sides would block on full pipes.
+#[tokio::test]
+async fn large_prompt_does_not_deadlock_against_early_output() {
+    let h = Harness::new();
+    std::fs::write(h.fake_dir.join("noisy"), "").unwrap();
+    let client = connect(&h).await;
+
+    let prompt = "x".repeat(1024 * 1024);
+    let result = tokio::time::timeout(
+        Duration::from_secs(20),
+        run_turn(&client, json!({ "prompt": prompt })),
+    )
+    .await
+    .expect("turn deadlocked");
+    assert_eq!(structured(&result)["completed"], true);
+    assert_eq!(h.recorded("stdin").len(), prompt.len());
+    client.cancel().await.unwrap();
 }
 
-impl HangingTurn {
-    async fn start(h: &Harness) -> Self {
-        use tokio::io::AsyncWriteExt as _;
+/// Spec (`LIF-1`, `BND-1`): a turn ends when the agent exits, even if something it left running in the background
+/// still holds its output pipes open, and that leftover process is killed.
+#[tokio::test]
+async fn background_leftovers_neither_hang_the_turn_nor_survive_it() {
+    let h = Harness::new();
+    let client = connect(&h).await;
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        run_turn(&client, json!({ "prompt": "linger" })),
+    )
+    .await
+    .expect("turn waited for a background process's pipes");
+    assert_eq!(structured(&result)["completed"], true);
+    let lingering: i32 = h.recorded("linger").trim().parse().unwrap();
+    assert_all_gone(&[lingering], "background process outlived its turn").await;
+    client.cancel().await.unwrap();
+}
+
+/// A leftover that escaped into its own session cannot be killed once the agent has exited (SPEC_impl.md documents
+/// this gap), but it must still not hold the turn open: devbox-mcp stops reading the pipes after a short grace period.
+#[tokio::test]
+async fn detached_leftovers_do_not_hang_the_turn() {
+    let h = Harness::new();
+    let client = connect(&h).await;
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        run_turn(&client, json!({ "prompt": "linger-detached" })),
+    )
+    .await
+    .expect("turn waited for a detached process's pipes");
+    assert_eq!(structured(&result)["completed"], true);
+    let lingering: i32 = h.recorded("linger").trim().parse().unwrap();
+    send_signal(lingering as u32, libc::SIGKILL);
+    client.cancel().await.unwrap();
+}
+
+/// A devbox-mcp process driven over raw JSON-RPC.
+///
+/// The shutdown and cancellation tests bypass rmcp's client because they need exact control over what devbox-mcp sees:
+/// whether its stdin is closed, which signals arrive, and when a cancellation notification is sent. rmcp's client
+/// transport neither exposes the server's stdin nor reliably closes it on shutdown; it falls back to SIGKILL, which is
+/// not what tunnel-client does.
+struct RawServer {
+    server: tokio::process::Child,
+    stdin: Option<tokio::process::ChildStdin>,
+    stdout: tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+}
+
+impl RawServer {
+    fn start(h: &Harness) -> Self {
+        use tokio::io::AsyncBufReadExt as _;
 
         let mut server = Command::new(DEVBOX_MCP)
+            .env_clear()
+            .envs(hermetic_env(h.tmp.path()))
             .args(h.devbox_args())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .unwrap();
-        let mut stdin = server.stdin.take().unwrap();
-        // Drain stdout so the server can never block writing a response.
-        let mut stdout = server.stdout.take().unwrap();
-        tokio::spawn(async move { tokio::io::copy(&mut stdout, &mut tokio::io::sink()).await });
-
-        let messages = [
-            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
-                "protocolVersion": "2025-06-18", "capabilities": {},
-                "clientInfo": {"name": "test", "version": "0"}}}),
-            json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
-            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
-                "name": "run_turn", "arguments": {"prompt": "hang"}}}),
-        ];
-        for msg in messages {
-            stdin
-                .write_all(format!("{msg}\n").as_bytes())
-                .await
-                .unwrap();
-        }
-        stdin.flush().await.unwrap();
-
-        let agent_pids = h.hanging_agent_pids().await;
+        let stdin = server.stdin.take();
+        let stdout = tokio::io::BufReader::new(server.stdout.take().unwrap()).lines();
         Self {
             server,
-            stdin: Some(stdin),
-            agent_pids,
+            stdin,
+            stdout,
         }
     }
 
-    /// Asserts that devbox-mcp exits on its own, successfully (an orderly shutdown, not a crash or a kill), and that
-    /// the agent and every process it started are gone.
+    async fn send(&mut self, msg: Value) {
+        use tokio::io::AsyncWriteExt as _;
+        let stdin = self.stdin.as_mut().unwrap();
+        stdin
+            .write_all(format!("{msg}\n").as_bytes())
+            .await
+            .unwrap();
+        stdin.flush().await.unwrap();
+    }
+
+    /// Reads the next message from devbox-mcp.
+    async fn recv(&mut self) -> Value {
+        let line = tokio::time::timeout(Duration::from_secs(10), self.stdout.next_line())
+            .await
+            .expect("no response from devbox-mcp")
+            .unwrap()
+            .expect("devbox-mcp closed stdout");
+        serde_json::from_str(&line).unwrap()
+    }
+
+    /// Sends `initialize` and waits for its response, leaving the session one step short of fully initialized.
+    async fn initialize(&mut self) {
+        self.send(
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18", "capabilities": {},
+            "clientInfo": {"name": "test", "version": "0"}}}),
+        )
+        .await;
+        assert_eq!(self.recv().await["id"], 1);
+    }
+
+    /// Initializes fully and starts a `hang` turn as request 2, returning the agent's PIDs (see
+    /// `Harness::hanging_agent_pids`).
+    async fn start_hanging_turn(&mut self, h: &Harness) -> Vec<i32> {
+        self.initialize().await;
+        self.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .await;
+        self.send(
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+            "name": "run_turn", "arguments": {"prompt": "hang"}}}),
+        )
+        .await;
+        h.hanging_agent_pids().await
+    }
+
+    fn close_stdin(&mut self) {
+        drop(self.stdin.take());
+    }
+
+    fn signal(&self, signal: i32) {
+        send_signal(self.server.id().unwrap(), signal);
+    }
+
+    /// Asserts that devbox-mcp exits on its own, successfully (an orderly shutdown, not a crash or a kill).
     async fn assert_clean_exit(mut self) {
         let status = tokio::time::timeout(Duration::from_secs(10), self.server.wait())
             .await
             .expect("devbox-mcp did not exit")
             .unwrap();
         assert!(status.success(), "devbox-mcp exited with {status}");
-        assert_all_gone(&self.agent_pids, "agent survived devbox-mcp shutting down").await;
     }
 }
 
 /// Spec (`LIF-1`): when tunnel-client stops devbox-mcp, devbox-mcp exits and takes the agent's processes with it,
-/// including commands the agent started, so nothing keeps running on the box unobserved. This mimics tunnel-client's
-/// stop sequence exactly: close the child's stdin and send it SIGTERM. Before devbox-mcp handled SIGTERM, this left the
-/// agent's background commands running.
+/// including commands the agent started in other sessions, the way Codex runs shell commands. This mimics
+/// tunnel-client's stop sequence exactly: close the child's stdin and send it SIGTERM.
 #[tokio::test]
 async fn tunnel_client_stop_kills_the_agent_and_its_children() {
     let h = Harness::new();
-    let mut turn = HangingTurn::start(&h).await;
-    drop(turn.stdin.take());
-    send_signal(turn.server.id().unwrap(), libc::SIGTERM);
-    turn.assert_clean_exit().await;
+    let mut server = RawServer::start(&h);
+    let pids = server.start_hanging_turn(&h).await;
+    server.close_stdin();
+    server.signal(libc::SIGTERM);
+    server.assert_clean_exit().await;
+    assert_all_gone(&pids, "agent survived devbox-mcp shutting down").await;
 }
 
 /// Spec (`LIF-1`): if tunnel-client itself dies, devbox-mcp only sees its stdin reach end of file. That alone must be
@@ -208,7 +304,61 @@ async fn tunnel_client_stop_kills_the_agent_and_its_children() {
 #[tokio::test]
 async fn stdin_eof_kills_the_agent_and_its_children() {
     let h = Harness::new();
-    let mut turn = HangingTurn::start(&h).await;
-    drop(turn.stdin.take());
-    turn.assert_clean_exit().await;
+    let mut server = RawServer::start(&h);
+    let pids = server.start_hanging_turn(&h).await;
+    server.close_stdin();
+    server.assert_clean_exit().await;
+    assert_all_gone(&pids, "agent survived devbox-mcp shutting down").await;
+}
+
+/// Spec (`LIF-1`): SIGTERM alone, with stdin still open, also shuts devbox-mcp down. This is what happens when a service
+/// manager stops every process of a service at once. Shutdown used to hang here, waiting on the blocking stdin read.
+#[tokio::test]
+async fn sigterm_with_stdin_open_still_shuts_down() {
+    let h = Harness::new();
+    let mut server = RawServer::start(&h);
+    let pids = server.start_hanging_turn(&h).await;
+    server.signal(libc::SIGTERM);
+    server.assert_clean_exit().await;
+    assert_all_gone(&pids, "agent survived devbox-mcp shutting down").await;
+}
+
+/// A client that never finishes MCP initialization must not make devbox-mcp unstoppable: SIGTERM during
+/// initialization shuts it down cleanly.
+#[tokio::test]
+async fn sigterm_during_initialization_shuts_down() {
+    let h = Harness::new();
+    let mut server = RawServer::start(&h);
+    server.initialize().await;
+    server.signal(libc::SIGTERM);
+    server.assert_clean_exit().await;
+}
+
+/// Spec (`LIF-1`): when the client cancels a running call (`notifications/cancelled`), the agent and everything it
+/// started are killed, and devbox-mcp itself keeps serving. rmcp does not drop a cancelled handler by itself, so this
+/// fails if the handler ignores its cancellation token.
+#[tokio::test]
+async fn cancelling_a_call_kills_its_agent() {
+    let h = Harness::new();
+    let mut server = RawServer::start(&h);
+    let pids = server.start_hanging_turn(&h).await;
+    server
+        .send(
+            json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+            "params": {"requestId": 2, "reason": "test"}}),
+        )
+        .await;
+    assert_all_gone(&pids, "agent survived its call being cancelled").await;
+
+    server
+        .send(json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}))
+        .await;
+    // Skip anything devbox-mcp sends about the cancelled call; what matters is that it still answers.
+    loop {
+        if server.recv().await["id"] == 3 {
+            break;
+        }
+    }
+    server.close_stdin();
+    server.assert_clean_exit().await;
 }

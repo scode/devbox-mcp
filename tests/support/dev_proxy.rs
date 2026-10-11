@@ -50,12 +50,17 @@ impl DevProxy {
     /// `devbox_mcp` and `devbox_args` form the command tunnel-client launches. `scratch` must be an existing directory
     /// the caller owns; the proxy's socket, connection file, and log go there. `response_timeout` is how long the proxy
     /// waits for devbox-mcp to answer one request, standing in for the hosted relay's deadline.
+    ///
+    /// `env` is the *entire* environment of tunnel-client, and therefore of devbox-mcp and the agent below it. Nothing is
+    /// inherited, because tunnel-client takes configuration (profiles, PID files, control-plane settings) from
+    /// environment variables, and a developer's real tunnel setup must not leak into a test.
     pub async fn start(
         tunnel_client: &Path,
         devbox_mcp: &Path,
         devbox_args: &[String],
         scratch: &Path,
         response_timeout: Duration,
+        env: &[(String, std::ffi::OsString)],
     ) -> anyhow::Result<Self> {
         if !tunnel_client.exists() {
             bail!(
@@ -72,6 +77,8 @@ impl DevProxy {
         }
 
         let mut child = Command::new(tunnel_client)
+            .env_clear()
+            .envs(env.iter().map(|(k, v)| (k, v)))
             .args(["dev", "proxy", "--mcp-command"])
             .arg(&command_line)
             .arg("--listen-unix-socket")

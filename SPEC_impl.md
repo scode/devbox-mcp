@@ -40,17 +40,35 @@ v0.0.16: a tool call that outlives the deadline fails on the client side while d
 other call queued behind it times out too. So every tool call must return quickly no matter how long the agent works,
 which is the practical reason behind `TRN-1` and `BND-1`, and long-polling reads must wait well under the deadline.
 
-tunnel-client stops its child by closing the child's stdin and sending it SIGTERM. devbox-mcp therefore treats stdin
-reaching end of file, SIGTERM, and SIGINT alike as a request for an orderly shutdown: it returns from `main`, which
-drops the tokio runtime and with it every in-flight tool call, and dropping a call kills its agent.
+tunnel-client stops its child by closing the child's stdin and sending it SIGTERM, and a service manager may send
+SIGTERM to every process of a service at once, with stdin still open. devbox-mcp treats stdin reaching end of file,
+SIGTERM, and SIGINT alike as a request for an orderly shutdown, including while MCP initialization is still in progress.
+It shuts its tokio runtime down, which drops every in-flight tool call, and dropping a call kills its agent. The
+runtime's shutdown waits at most a second for blocking threads, because rmcp's stdin reader stays blocked in `read` for
+as long as stdin is open. A tool call the client cancels (`notifications/cancelled`) is dropped the same way; rmcp only
+signals the cancellation, so the handler races its work against it.
 
-Each turn is an agent child process started with an argument array, never a shell string. The child is started in its
-own process group, and a guard owned by the turn kills that whole group (so also any commands the agent started) when
-the turn ends or its call is dropped. On Linux the child also gets a parent-death signal, so it is killed if devbox-mcp
-dies abruptly. The kernel ties that signal to the thread that spawned the child, not the process, which is why
-devbox-mcp runs a current-thread tokio runtime: every child is spawned from the main thread. Known gap: on an abrupt
-death of devbox-mcp (SIGKILL, a crash), the parent-death signal reaches only the agent process itself, and commands the
-agent started may outlive it. Closing that gap (with a subreaper or a cgroup) is future work.
+Each turn is an agent child process started with an argument array, never a shell string, in its own process group.
+Killing that group is not enough: Codex runs every shell command in a new session, so a command's own children are in
+another process group (observed with codex-cli 0.162.1, where `bash -c "sleep 303 & sleep 120"` left both sleeps running
+after Codex was killed). A guard owned by the turn therefore kills the agent's whole process tree when the call is
+dropped. It walks `/proc` for every descendant, whatever its session or group, stopping each one so nothing can fork or
+escape while the walk runs, then kills them all. When the agent exits on its own, the turn ends at its exit rather than
+when its output pipes close, which a leftover background process could keep open forever; the guard then kills what is
+left in the agent's process group, and reading the pipes stops after a two-second grace period.
+
+On Linux the child also gets a parent-death signal, so it is killed if devbox-mcp dies abruptly; it checks after setting
+the signal that devbox-mcp did not die in the meantime. The kernel ties that signal to the thread that spawned the
+child, not the process, which is why devbox-mcp runs a current-thread tokio runtime: every child is spawned from the
+main thread.
+
+Known gaps, both of which need a cgroup per agent to close:
+
+- If devbox-mcp dies abruptly (SIGKILL, a crash), the parent-death signal reaches only the agent process itself, and
+  Codex's own parent-death signal only its direct children. Anything further down may outlive it.
+- A process that the agent's tree has already lost (its parent exited, so it was reparented to init) cannot be found by
+  the tree walk. When an agent exits normally, this is everything it left running outside its own process group. Codex
+  cleans up a finished command's process group itself, so in practice this takes something like a double-forking daemon.
 
 ## Configuration
 

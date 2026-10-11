@@ -24,16 +24,27 @@ use tempfile::TempDir;
 /// check exactly how devbox-mcp invoked it. Prompts select the behavior:
 ///
 /// - `fail...`: a failed turn.
-/// - `hang...`: starts a background `sleep` (standing in for a command the agent launched), records both PIDs, and never
-///   finishes.
+/// - `hang...`: never finishes. Like real Codex running a shell command, it first starts a shell in a new session (so
+///   in another process group), and that shell starts a background `sleep`. A cleanup that only kills the agent's
+///   process group misses both. PIDs go to `pids` (agent, session shell) and `detached` (the sleep).
 /// - `hiccup...`: an `error` event, then a normal completion.
+/// - `linger...`: completes normally, but first starts a background `sleep` in its own process group that keeps stdout
+///   and stderr open after the agent exits. Its PID goes to `linger`.
+/// - `linger-detached...`: like `linger`, but the sleep is in a new session, out of reach of any group kill, before the
+///   agent exits. Its PID goes to `linger`.
 /// - anything else: an echo reply.
+///
+/// If a file named `noisy` exists next to the fake, it writes 256 KiB to stderr before reading its prompt, which
+/// deadlocks against a large prompt unless devbox-mcp drains output while still writing the prompt.
 ///
 /// It is a shell script because the fake has to be a standalone executable and `sh` is everywhere these tests run.
 pub const FAKE_CODEX: &str = r#"#!/bin/sh
 dir=$(dirname "$0")
 printf '%s\n' "$@" > "$dir/argv"
 echo "$PPID" > "$dir/ppid"
+if [ -f "$dir/noisy" ]; then
+  head -c 262144 /dev/zero | tr '\0' x >&2
+fi
 prompt=$(cat)
 printf '%s' "$prompt" > "$dir/stdin"
 pwd > "$dir/cwd"
@@ -45,12 +56,22 @@ case "$prompt" in
     exit 1
     ;;
   hang*)
-    sleep 1000 &
-    echo "$$ $!" > "$dir/pids"
+    setsid sh -c 'sleep 1000 & echo $! > "$1.tmp" && mv "$1.tmp" "$1"; wait' sh "$dir/detached" &
+    echo "$$ $!" > "$dir/pids.tmp" && mv "$dir/pids.tmp" "$dir/pids"
     wait
     ;;
   hiccup*)
     echo '{"type":"error","message":"fake transient error"}'
+    ;;
+  linger-detached*)
+    # The PID is written from inside the new session and waited for, because exiting before the child has detached
+    # would leave it in this process group, where devbox-mcp rightly kills it.
+    setsid sh -c 'echo $$ > "$1.tmp" && mv "$1.tmp" "$1" && exec sleep 1000' sh "$dir/linger" &
+    while [ ! -f "$dir/linger" ]; do sleep 0.01; done
+    ;;
+  linger*)
+    sleep 1000 &
+    echo "$!" > "$dir/linger"
     ;;
 esac
 echo '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"fake reply: '"$prompt"'"}}'
@@ -99,26 +120,27 @@ impl Harness {
         std::fs::read_to_string(self.fake_dir.join(name)).unwrap()
     }
 
-    /// Waits for a `hang` turn to start, and returns the PIDs of the fake agent and the background command it started.
+    /// Waits for a `hang` turn to fully start, and returns the PIDs of the fake agent, the shell it started in a new
+    /// session, and that shell's background `sleep`.
     pub async fn hanging_agent_pids(&self) -> Vec<i32> {
-        let pids_file = self.fake_dir.join("pids");
+        let (pids, detached) = (self.fake_dir.join("pids"), self.fake_dir.join("detached"));
         assert!(
-            eventually(Duration::from_secs(10), || pids_file.exists()).await,
+            eventually(Duration::from_secs(10), || pids.exists()
+                && detached.exists())
+            .await,
             "fake agent never started"
         );
-        // The fake writes the file with one `echo`, but a read can still race the write.
-        let pids: Vec<i32> = loop {
-            let pids: Vec<i32> = self
-                .recorded("pids")
-                .split_whitespace()
-                .filter_map(|p| p.parse().ok())
-                .collect();
-            if pids.len() == 2 {
-                break pids;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        };
-        assert!(pids.iter().all(|&p| process_exists(p)));
+        // Both files are written to a temporary name and renamed into place, so they are complete when they exist.
+        let pids: Vec<i32> = [self.recorded("pids"), self.recorded("detached")]
+            .iter()
+            .flat_map(|s| {
+                s.split_whitespace()
+                    .map(|p| p.parse().unwrap())
+                    .collect::<Vec<i32>>()
+            })
+            .collect();
+        assert_eq!(pids.len(), 3);
+        assert!(pids.iter().all(|&p| process_running(p)));
         pids
     }
 }
@@ -138,11 +160,19 @@ pub fn structured(result: &CallToolResult) -> &Value {
         .expect("run_turn returns structured content")
 }
 
-/// True if a process with this PID exists. Zombies count as existing, which is why callers poll: a killed process
-/// whose parent was also killed is reaped by init shortly after.
-pub fn process_exists(pid: i32) -> bool {
-    // SAFETY: signal 0 performs only the existence and permission check; nothing is delivered.
-    unsafe { libc::kill(pid, 0) == 0 }
+/// True if a process with this PID exists and is not a zombie.
+///
+/// Zombies count as gone: a killed process stays a zombie until its parent reaps it, and in a container whose init does
+/// not reap orphans that may be never, even though the process stopped running long ago.
+pub fn process_running(pid: i32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    // The state follows the command name, which is in parentheses and may itself contain them.
+    let state = stat
+        .rfind(')')
+        .and_then(|i| stat[i + 1..].split_whitespace().next());
+    state != Some("Z")
 }
 
 /// Sends `signal` to `pid`, failing the test if that is impossible.
@@ -164,11 +194,26 @@ pub async fn eventually(timeout: Duration, mut cond: impl FnMut() -> bool) -> bo
     cond()
 }
 
-/// Asserts that every PID in `pids` is gone within a few seconds.
+/// Asserts that every PID in `pids` stops running within a few seconds.
 pub async fn assert_all_gone(pids: &[i32], what: &str) {
     let gone = eventually(Duration::from_secs(10), || {
-        pids.iter().all(|&p| !process_exists(p))
+        pids.iter().all(|&p| !process_running(p))
     })
     .await;
     assert!(gone, "{what}: processes {pids:?} are still running");
+}
+
+/// The environment for child processes that should not see the test runner's configuration.
+///
+/// Programs under test (tunnel-client in particular) read configuration from environment variables, so inheriting the
+/// developer's environment could point them at real profiles or real PID files. Children get only `PATH`, and a `HOME`
+/// inside the test's temporary directory. The test process's own environment is never modified.
+pub fn hermetic_env(home: &std::path::Path) -> Vec<(String, std::ffi::OsString)> {
+    vec![
+        (
+            "PATH".to_owned(),
+            std::env::var_os("PATH").unwrap_or_default(),
+        ),
+        ("HOME".to_owned(), home.as_os_str().to_owned()),
+    ]
 }
