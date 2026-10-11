@@ -26,3 +26,8 @@ Rules:
   `fix`, not `refactor`. A new CLI flag is `feat`, not `chore`.
 - The summary after the colon is lowercase, imperative mood, no trailing period.
 - Keep the first line under 72 characters.
+
+## Lore
+
+The ./lore directory contains historical information about the project. Only use it for historical digging or when
+requested. Current project behavior does not use or depend on it, and routine maintenance does not touch it.
