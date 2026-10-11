@@ -1,0 +1,264 @@
+//! `devbox-mcp setup`: configures this box to serve devbox-mcp through the OpenAI tunnel, as a systemd user service
+//! (SPEC_impl.md, "Deployment").
+//!
+//! Everything specific to one deployment (the tunnel ID and the runtime key) is given here, on the box, so none of it is
+//! in the repository. Setup writes three things and runs nothing else: tunnel-client's profile (by running
+//! `tunnel-client init`, so devbox-mcp never writes tunnel-client's YAML), an environment file holding the key, and the
+//! unit. Enabling and starting the service is left to the user, who gets the commands printed, because those change
+//! what runs on the box from then on.
+//!
+//! Paths go into a unit file and a command line unescaped, so any path that would need escaping is refused instead.
+//! Escaping correctly for both systemd and tunnel-client's command splitting is easy to get subtly wrong, and refusing
+//! costs a deployment nothing it needs.
+
+use std::fs::{self, OpenOptions, Permissions};
+use std::io::{IsTerminal as _, Read as _, Write as _};
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use anyhow::{Context as _, bail};
+
+/// The tunnel-client profile name setup creates and the unit runs.
+const PROFILE: &str = "devbox";
+
+/// The unit's name, under `~/.config/systemd/user/`.
+const UNIT_NAME: &str = "devbox-mcp.service";
+
+/// Flags of `devbox-mcp setup`.
+#[derive(Debug, clap::Args)]
+pub struct SetupArgs {
+    /// The tunnel's ID, as shown on the tunnel management page (`tunnel_` followed by 32 lowercase letters or digits).
+    /// The runtime key is read from stdin, never from the command line, where other processes could see it.
+    #[arg(long)]
+    tunnel_id: String,
+
+    /// The Codex executable the service runs. Defaults to `codex` as found on PATH now, because the service's own PATH
+    /// is minimal and usually lacks the directory it is in.
+    #[arg(long)]
+    codex_bin: Option<PathBuf>,
+
+    /// The tunnel-client executable the service runs. Defaults to ~/.local/bin/tunnel-client.
+    #[arg(long)]
+    tunnel_client: Option<PathBuf>,
+
+    /// Set up in this home directory instead of the current user's. For tests.
+    #[arg(long, hide = true)]
+    home: Option<PathBuf>,
+}
+
+/// Runs setup: validates everything first, so a refused setup has changed nothing, then writes the profile, the key,
+/// and the unit, in that order.
+pub fn run(args: SetupArgs) -> anyhow::Result<()> {
+    let home = match args.home {
+        Some(home) => home,
+        None => std::env::home_dir().context("cannot determine home directory")?,
+    };
+    // This binary is what tunnel-client will start, so it must be the installed copy, not a build directory's.
+    let devbox_mcp = std::env::current_exe().context("cannot determine devbox-mcp's own path")?;
+    let codex = match args.codex_bin {
+        Some(path) => path,
+        None => find_on_path("codex").context("codex is not on PATH; pass --codex-bin")?,
+    };
+    let tunnel_client = args
+        .tunnel_client
+        .unwrap_or_else(|| home.join(".local/bin/tunnel-client"));
+
+    let config = home.join(".config");
+    let profile_dir = config.join("tunnel-client");
+    let env_dir = config.join("devbox-mcp");
+    let env_file = env_dir.join("tunnel.env");
+    let unit_dir = config.join("systemd/user");
+    for (what, path) in [
+        ("devbox-mcp", &devbox_mcp),
+        ("codex", &codex),
+        ("tunnel-client", &tunnel_client),
+        ("home", &home),
+    ] {
+        plain_path(what, path)?;
+    }
+    for (what, path) in [
+        ("devbox-mcp", &devbox_mcp),
+        ("codex", &codex),
+        ("tunnel-client", &tunnel_client),
+    ] {
+        if !is_executable(path) {
+            bail!("{what} at {} is missing or not executable", path.display());
+        }
+    }
+
+    let key = read_key()?;
+
+    let mcp_command = format!("{} --codex-bin {}", devbox_mcp.display(), codex.display());
+    // init's own stdout is kept from the user: it advises running `tunnel-client run` in the foreground, which would
+    // serve the admin API on loopback TCP (the profile's default) instead of the unit's private socket (`SEC-3`). It is
+    // shown only if init fails, since its error messages may be there.
+    let output = Command::new(&tunnel_client)
+        .args(["init", "--force", "--profile", PROFILE, "--profile-dir"])
+        .arg(&profile_dir)
+        .args([
+            "--tunnel-id",
+            &args.tunnel_id,
+            "--mcp-command",
+            &mcp_command,
+        ])
+        .stderr(Stdio::inherit())
+        .output()
+        .with_context(|| format!("cannot run {}", tunnel_client.display()))?;
+    if !output.status.success() {
+        bail!(
+            "tunnel-client init failed ({}); nothing else was changed. Its output:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout).trim_end()
+        );
+    }
+
+    create_private_dir(&env_dir)?;
+    write_private(&env_file, &format!("CONTROL_PLANE_API_KEY={key}\n"))?;
+
+    fs::create_dir_all(&unit_dir)
+        .with_context(|| format!("cannot create {}", unit_dir.display()))?;
+    let unit = unit_dir.join(UNIT_NAME);
+    fs::write(&unit, unit_text(&tunnel_client, &profile_dir, &env_file))
+        .with_context(|| format!("cannot write {}", unit.display()))?;
+
+    println!(
+        "Wrote the tunnel-client profile {PROFILE:?} in {}, the runtime key to {}, and {}.\n\
+         \n\
+         To start the service, now and at every boot:\n\
+         \n\
+         \x20   loginctl enable-linger\n\
+         \x20   systemctl --user daemon-reload\n\
+         \x20   systemctl --user enable --now {UNIT_NAME}\n\
+         \n\
+         If it is already running, restart it instead to pick up the change:\n\
+         \n\
+         \x20   systemctl --user daemon-reload\n\
+         \x20   systemctl --user restart {UNIT_NAME}",
+        profile_dir.display(),
+        env_file.display(),
+        unit.display()
+    );
+    Ok(())
+}
+
+/// The unit, from one fixed text with the paths filled in.
+///
+/// The health and admin listener goes on a Unix socket in a runtime directory only this user can enter: tunnel-client's
+/// admin API can start Codex with full access, so on its default loopback TCP port any local user could use it
+/// (SPEC.md `SEC-3`). `Restart=always` because tunnel-client exits with status 0 when devbox-mcp crashes. The rest is
+/// explained in SPEC_impl.md, "Deployment".
+fn unit_text(tunnel_client: &Path, profile_dir: &Path, env_file: &Path) -> String {
+    format!(
+        "\
+# Written by `devbox-mcp setup`; running it again replaces this file.
+[Unit]
+Description=devbox-mcp, reached through the OpenAI tunnel
+
+[Service]
+EnvironmentFile={env_file}
+ExecStart={tunnel_client} run --profile {PROFILE} --profile-dir {profile_dir} --health.unix-socket %t/devbox-mcp/tunnel-client.sock
+RuntimeDirectory=devbox-mcp
+RuntimeDirectoryMode=0700
+Restart=always
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target
+",
+        env_file = env_file.display(),
+        tunnel_client = tunnel_client.display(),
+        profile_dir = profile_dir.display(),
+    )
+}
+
+/// Refuses a path that is relative or would need escaping in a unit file or in tunnel-client's MCP command line:
+/// whitespace, quotes, backslashes, `%` (a systemd specifier), and `$` (systemd variable expansion).
+fn plain_path(what: &str, path: &Path) -> anyhow::Result<()> {
+    let Some(text) = path.to_str() else {
+        bail!("the {what} path {} is not valid UTF-8", path.display());
+    };
+    if !path.is_absolute() {
+        bail!("the {what} path {text:?} must be absolute");
+    }
+    if text
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '"' | '\'' | '\\' | '%' | '$'))
+    {
+        bail!(
+            "the {what} path {text:?} contains a character that would need escaping in a unit file (whitespace, a \
+             quote, a backslash, '%', or '$'); use a path without one"
+        );
+    }
+    Ok(())
+}
+
+/// Reads the runtime key from stdin: one line, of printable ASCII without spaces, quotes, or backslashes, so it can go
+/// into an environment file unquoted.
+fn read_key() -> anyhow::Result<String> {
+    let mut stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        eprintln!("Paste the tunnel's runtime API key, then press Enter and Ctrl-D:");
+    }
+    let mut input = String::new();
+    stdin
+        .read_to_string(&mut input)
+        .context("cannot read the runtime key from stdin")?;
+    let key = input.trim();
+    if key.is_empty() {
+        bail!("no runtime key on stdin; pipe it in, for example from a file");
+    }
+    if !key
+        .chars()
+        .all(|c| c.is_ascii_graphic() && !matches!(c, '"' | '\'' | '\\'))
+    {
+        bail!(
+            "the runtime key on stdin is not one word of printable ASCII without quotes or backslashes"
+        );
+    }
+    Ok(key.to_owned())
+}
+
+/// Creates a directory readable only by the user, or tightens an existing one.
+fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
+    fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    fs::set_permissions(dir, Permissions::from_mode(0o700))
+        .with_context(|| format!("cannot restrict {}", dir.display()))
+}
+
+/// Writes a new file readable only by the user, replacing whatever was at `path`.
+///
+/// The old entry is removed rather than opened, so the contents never go through a symlink or hardlink someone left
+/// there into another file, and a file whose mode was loosened is not reused. The new file is created exclusively with
+/// mode 0600, so it is never readable by others, not even briefly.
+fn write_private(path: &Path, contents: &str) -> anyhow::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("cannot replace {}", path.display())),
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("cannot create {}", path.display()))?;
+    file.write_all(contents.as_bytes())
+        .with_context(|| format!("cannot write {}", path.display()))
+}
+
+/// Whether `path` is a regular file (after following symlinks) that someone may execute.
+fn is_executable(path: &Path) -> bool {
+    path.metadata()
+        .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+/// Finds an executable on PATH, as the shell would, returning its absolute path.
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(name))
+        .find(|path| is_executable(path))
+}

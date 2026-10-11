@@ -9,6 +9,7 @@ mod events;
 mod process;
 mod server;
 mod sessions;
+mod setup;
 mod store;
 
 use std::path::PathBuf;
@@ -38,6 +39,17 @@ struct Args {
     /// absolute. Only one devbox-mcp can use a state directory at a time.
     #[arg(long)]
     state_dir: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// Without a subcommand, devbox-mcp serves MCP over stdio, which is how tunnel-client runs it.
+#[derive(Debug, clap::Subcommand)]
+enum Command {
+    /// Set up this box to serve devbox-mcp through the OpenAI tunnel, as a systemd user service: writes the
+    /// tunnel-client profile, the runtime key (read from stdin), and the unit, then prints the commands that start it.
+    Setup(setup::SetupArgs),
 }
 
 /// The default working directory root, `~/devbox-mcp/work`.
@@ -68,6 +80,9 @@ const BLOCKING_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    if let Some(Command::Setup(setup_args)) = args.command {
+        return setup::run(setup_args);
+    }
     let workdir_root = match args.workdir_root {
         Some(dir) => dir,
         None => default_workdir_root()?,
