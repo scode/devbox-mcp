@@ -4,6 +4,19 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/scode/devbox-mcp"
-description = "MCP server that lets agents interact with a remote Linux box"
+description = "MCP server that lets remote agents drive coding agents on a Linux box"
 
 [dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+libc = "0.2"
+# Server and stdio only. Never enable a feature that can listen for connections (SPEC.md SEC-2, SPEC_impl.md).
+rmcp = { version = "3.5.1", default-features = false, features = ["server", "macros", "transport-io"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.53.2", features = ["macros", "rt", "process", "io-util", "io-std", "signal"] }
+
+[dev-dependencies]
+# The client side is only for tests and the manual driver in examples/.
+rmcp = { version = "3.5.1", default-features = false, features = ["client", "transport-child-process"] }
+tempfile = "3.27.0"
