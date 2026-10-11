@@ -115,6 +115,46 @@ needs because nobody is there to approve a call. List exactly the devbox tools t
 `mcp__devbox__<tool>`. Both options take a variable number of values, so `--` is needed before the prompt, or the prompt
 is swallowed as one more tool name.
 
+### The cold-agent check
+
+SPEC_impl.md "Self-documentation" asks for this layer to be run as a "cold agent" check whenever the tools or their
+descriptions change: a model that knows nothing about devbox-mcp gets tasks phrased the way a user would give them to a
+Dot, with no hints about tool names, polling, or cursors, and has to handle each correctly. Give each scenario its own
+scratch `--workdir-root` and `--state-dir`, and add `--output-format stream-json --verbose` to see every call the model
+made and what came back. The prompts used so far:
+
+- Normal flow: "On my dev box, have an agent create a file hello.txt containing the word hi in its working directory,
+  and tell me what it did. Then have the same agent append a second line with the word there, and show me the file's
+  final contents." Expect one session, two turns, each followed to its end with `session_read`.
+- Busy session: "On my dev box, have an agent run the shell command 'sleep 90' and then reply with the word done. As
+  soon as you have started that, also ask that same agent what today's date is, and report both answers to me." Expect
+  the second send to fail as busy, and the model to wait for the first turn (or interrupt it) before sending again.
+- Failed turn: start devbox-mcp with `--codex-bin` pointing at a script that reads its stdin, prints an error to stderr,
+  and exits 1, then ask "On my dev box, have an agent list the files in its working directory and tell me what it
+  found." Expect the model to report that the turn failed, with the reason.
+- Interrupt: "On my dev box, have an agent run the shell command 'sleep 600'. Once it has started, I changed my mind:
+  stop it, and confirm to me that it has actually stopped." Expect `session_interrupt`, then reads until the turn is
+  `interrupted`, and a report that mentions it if the turn has `cleanup_uncertain` set.
+- Restart: two runs sharing one `--state-dir`. The first: "On my dev box, have an agent in a session named nightly run
+  the shell command 'sleep 300' and then reply with the word done. Do not wait for it to finish; just tell me it has
+  started." The run ends while the turn is still going, which stops devbox-mcp and its agent. The second: "Earlier,
+  something was started on my dev box in a session named nightly. Find out how it went, and if it did not finish, run it
+  again, but with 'sleep 5' instead of 'sleep 300', and tell me the result." Expect the model to find the turn `lost`,
+  and send again to the same session.
+
+A model with nothing else to do polls `session_read` back to back, since print mode has no way to wait; around 70 reads
+for a 90-second turn were seen, and say nothing about the descriptions. So the budget is generous but finite: a scenario
+fails if it takes more than 200 tool calls (count the `tool_use` entries in the stream output), or if the model stops
+before the outcome it was asked for. Misuse that does say something about them (wrong tools, resending blindly,
+misreading a result) is fixed in the descriptions, not in the prompts. To see what the client actually showed the model,
+ask it in one more run to quote the devbox-mcp tool descriptions and any server instructions it was given. When this was
+written, Claude Code showed the server instructions, the tool descriptions, and the argument schemas, but not the result
+schemas, which is why anything a caller must know about a result is also in the tool's description.
+
+Running from a scratch directory keeps this repository's instructions out, but Claude Code still loads your own
+user-level instructions (`~/.claude/CLAUDE.md`), and the model may mention them. `--bare` would skip them but only
+accepts API-key authentication.
+
 This talks stdio directly, without tunnel-client, so it says nothing about deadlines or serialization; combine it with
 layer 2's tunnel mode for those. It is also not the same client as a ChatGPT Dot, which may present tools,
 confirmations, and long-running calls differently.

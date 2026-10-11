@@ -134,11 +134,17 @@ impl DevboxServer {
     #[tool(
         description = "Send a message to a session's agent, starting a turn: the agent works on it in the background, \
                        for seconds or for many minutes, and this call returns at once without waiting. Then follow the \
-                       turn with session_read, passing the returned cursor, until the turn's state is no longer \
-                       `running` or `interrupting`; the agent's reply is then in the turn's `final_message`. A session \
-                       runs one turn at a time: sending while a turn is still running fails with a 'busy' error \
-                       (wait for the turn to end, or stop it with session_interrupt). The agent remembers earlier turns \
-                       of the same session, so follow-ups can refer to earlier work."
+                       turn with session_read, passing the returned cursor and then each read's `next_cursor`, until \
+                       the turn's state is neither `running` nor `interrupting` and `more` is false; the agent's reply \
+                       is then in the turn's `final_message`. A session runs one turn at a time: sending while a turn \
+                       is still running fails with a 'busy' error (wait for the turn to end, or stop it with \
+                       session_interrupt). The agent remembers earlier turns of the same session, so follow-ups can \
+                       refer to earlier work, unless the result has `context_reset` true: then the agent could not \
+                       continue its earlier conversation and starts without it, so put any context it needs into the \
+                       message. If you are not sure a send went through, send again with the same `request_id`: you \
+                       get the original turn, with `replayed` true. session_read always shows the session's most \
+                       recent turn, so if a replayed `turn_id` is older than the turn a read shows, later turns have \
+                       replaced it and its outcome is no longer available."
     )]
     async fn session_send(
         &self,
@@ -173,11 +179,14 @@ impl DevboxServer {
 
     /// Starts interrupting a running turn (SPEC.md `TRN-4`).
     #[tool(
-        description = "Stop a session's running turn. Returns at once with the turn in state `interrupting`; the agent \
-                       and everything it started are then killed, and the turn becomes `interrupted` once they are \
-                       gone (follow it with session_read). If the agent happened to finish just before, the turn keeps \
-                       its own outcome. If no turn is running, nothing changes and the most recent turn is returned. \
-                       Work the agent already did (file changes, for example) is not undone."
+        description = "Stop a session's running turn. Returns at once with the turn in state `interrupting`; \
+                       devbox-mcp then kills the agent and the processes it started, and the turn becomes \
+                       `interrupted` once the agent is gone (follow it with session_read). If the ended turn has \
+                       `cleanup_uncertain` true, devbox-mcp could not confirm that every process the agent started is \
+                       gone, so do not report a clean stop. If the agent happened to finish just before, the turn \
+                       keeps its own outcome. If no turn is running, nothing changes and the most recent turn is \
+                       returned; a session that was never sent a message has no turn, and that is an error. Work the \
+                       agent already did (file changes, for example) is not undone."
     )]
     async fn session_interrupt(
         &self,

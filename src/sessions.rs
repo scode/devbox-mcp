@@ -339,10 +339,12 @@ pub struct SendResult {
     /// that earlier send started.
     pub replayed: bool,
     /// Pass this to `session_read` to get the turn's events from its start. Null when those events are no longer held
-    /// (a retried send of an older turn, or after devbox-mcp restarted); read without a cursor then.
+    /// (a retried send of an older turn, or after devbox-mcp restarted); read without a cursor then, keeping in mind
+    /// that a read always shows the session's most recent turn, which may be a later one than this.
     pub cursor: Option<String>,
-    /// True when the agent could not continue its earlier conversation in this session (devbox-mcp lost track of it
-    /// during a restart), so this turn starts a fresh conversation without the earlier context.
+    /// True when the agent could not continue its earlier conversation in this session, because devbox-mcp never
+    /// learned that conversation's ID (the previous turn failed or was stopped before the agent got going, or
+    /// devbox-mcp restarted early in it), so this turn starts a fresh conversation without the earlier context.
     pub context_reset: bool,
 }
 

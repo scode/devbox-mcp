@@ -11,8 +11,7 @@ the security posture (`SEC-*`, `TSP-1`), `LIF-1` for orderly shutdowns, sessions
 adapter, the session store of "Storage", and turns (`TRN-*`) with "Turn lifecycle", "Turn events", cursors, request IDs,
 liveness, and the bounds of `BND-*`, through the five session tools.
 
-Not yet implemented: transcripts (`TRA-*`), session removal (`SES-1`, `SES-6`), the automated "Self-documentation"
-checks, and "Deployment".
+Not yet implemented: transcripts (`TRA-*`), session removal (`SES-1`, `SES-6`), and "Deployment".
 
 ## Language and dependencies
 
