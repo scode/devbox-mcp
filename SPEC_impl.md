@@ -11,17 +11,23 @@ the testing flow around it. It exposes a single tool, `run_turn`, which runs one
 blocks until the turn ends, returning the agent's final message. Implemented so far: the stdio transport and the
 security posture (`SEC-*`, `TSP-1`), a first Codex adapter, and `LIF-1` for orderly shutdowns.
 
-Not yet implemented, and contradicted by the prototype until it is: sessions (`SES-*`), turns that run in the background
-and are read incrementally (`TRN-*`; `run_turn` blocks instead), transcripts (`TRA-*`), model and effort selection
-(`SES-7`), and response bounds (`BND-1`; `run_turn` returns the whole reply and blocks for as long as the turn takes).
-`run_turn` goes away once sessions exist. Of the configuration flags below, only `--workdir-root` and `--codex-bin`
-exist so far, and `--workdir-root` is currently used directly as the default working directory.
+Not yet implemented, and contradicted by the prototype until it is: turns that run in the background and are read
+incrementally (`TRN-*`; `run_turn` blocks instead), transcripts (`TRA-*`), model and effort selection (`SES-7`), and
+response bounds for `run_turn` (`BND-1`; it returns the whole reply and blocks for as long as the turn takes).
+`run_turn` goes away once sessions can run turns; it ignores sessions and still uses `--workdir-root` directly as its
+default working directory.
 
-Step 1 of the roadmap in TODO.md is being implemented. Done so far: the Codex module resumes sessions and maps Codex's
-output into the agent-agnostic events of "Turn events" (without the session-level `turn_started` and `turn_ended`), and
-`process::run_agent` runs any agent process with the containment of "Process model", including interrupts. Nothing of
-this is visible through the tools yet. Still to come: SPEC.md's "Self-documentation" and "MCP tools", and here
-"Storage", "Tools", "Turn lifecycle", "Self-documentation", the session-level events, and "Deployment".
+Step 1 of the roadmap in TODO.md is being implemented. Done so far:
+
+- the Codex module resumes sessions and maps Codex's output into the agent-agnostic events of "Turn events" (without the
+  session-level `turn_started` and `turn_ended`), and `process::run_agent` runs any agent process with the containment
+  of "Process model", including interrupts;
+- the session store of "Storage" (records, load-time mapping of unfinished turns to `lost`, unreadable records, the
+  state directory lock; request IDs come with sends) and the `session_create` and `session_list` tools, with all the
+  configuration flags below.
+
+Still to come: `session_send`, `session_read`, and `session_interrupt` with "Turn lifecycle" and the session-level
+events, the "Self-documentation" checks, and "Deployment".
 
 ## Language and dependencies
 
@@ -121,7 +127,8 @@ the correct state, and the next successful write of that session brings the file
 Records are read at startup. A most recent turn still recorded as `running` or `interrupting` is reported as `lost`
 (`TRN-5`); the file itself is updated with the session's next write. A record that cannot be parsed is left untouched, a
 warning naming it goes to stderr, it is left out of `session_list`, and creating a session with that name fails with an
-error saying an unreadable record is in the way.
+error saying an unreadable record is in the way. If the records cannot even be listed, devbox-mcp refuses to start:
+starting without knowing which names exist would let a create overwrite a record it never saw.
 
 devbox-mcp holds an exclusive lock (`flock`) on `<state-dir>/lock` for as long as it runs, so two instances can never
 share a state directory. tunnel-client may start a new devbox-mcp while the previous one is still shutting down, so a
