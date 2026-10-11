@@ -5,6 +5,7 @@
 //! built and how far along it is.
 
 mod codex;
+mod events;
 mod process;
 mod server;
 
