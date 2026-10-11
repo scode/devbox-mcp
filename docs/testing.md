@@ -33,10 +33,12 @@ cargo test
   command line, stdin, and working directory. It can also simulate failed and hanging turns, background leftovers, and
   noisy startup. Its hanging turn mirrors how real Codex runs shell commands, in a new session that a process group kill
   would miss; `tests/support/mod.rs` lists all the behaviors.
-- `tests/tunnel.rs` repeats the important paths with the real tunnel-client in between, via `dev proxy`: a turn through
-  its real request path, and its real way of stopping devbox-mcp. No test yet covers its one-at-a-time forwarding or its
-  response deadline (see SPEC_impl.md, "Process model"); the prototype's blocking `run_turn` would simply fail such a
-  test. Once turns run in the background, add one that checks a running turn does not hold up other calls.
+- `tests/sessions.rs` and `tests/turns.rs` cover the session and turn rules over stdio: names, working directories,
+  persistence across restarts, busy sessions, interrupts, retried sends, cursors and gaps, paging, and lost turns.
+- `tests/tunnel.rs` repeats the important paths with the real tunnel-client in between, via `dev proxy`: a whole session
+  flow through its real request path, its real way of stopping devbox-mcp, and the check that a running turn does not
+  hold up other calls, which matters because tunnel-client forwards calls one at a time (see SPEC_impl.md, "Process
+  model").
 
 The shutdown and cancellation tests are worth knowing about. They check that devbox-mcp exits cleanly and kills the
 agent's whole process tree, across sessions, in every way it can be stopped: tunnel-client stopping it (SIGTERM plus
@@ -60,8 +62,13 @@ cargo build
 scratch="$(mktemp -d)"
 cargo run --example mcp-call -- --list \
     --server-arg=--workdir-root="$scratch/work" --server-arg=--state-dir="$scratch/state" \
-    run_turn '{"prompt": "Say hello world and nothing else."}'
+    session_create '{"name": "demo"}' \
+    session_send '{"name": "demo", "message": "Say hello world and nothing else."}' \
+    wait_turn '{"name": "demo"}'
 ```
+
+`wait_turn` is a step of the driver, not an MCP tool: it polls `session_read` once a second until the session's most
+recent turn has ended, then prints every event and the final turn, which is what a caller does by hand.
 
 Add `--via-tunnel-client` to route the calls through tunnel-client's dev proxy instead of talking stdio directly. That
 is the closest local equivalent of production, and the mode to use whenever timing or the number of calls matters:
@@ -77,8 +84,10 @@ on, so a manual run against it would wait and then fail). Several `TOOL JSON` pa
 against the same server process; use that whenever a later call depends on state from an earlier one, because each
 invocation of the driver starts a fresh server.
 
-Expect a `run_turn` result with `"completed": true`, a `reply` from the agent, and Codex's `agent_session_id`. A hello
-world turn took about 10 seconds when this was written, in either mode.
+Expect `wait_turn` to show the events `turn_started`, `agent_message`, and `turn_ended`, and a turn with state
+`completed` and the agent's reply in `final_message`. A hello world turn took about 10 seconds when this was written.
+Adding a second `session_send` and `wait_turn` to the same session, asking the agent about its previous turn, checks
+that the agent kept its context.
 
 ## 3. A model as the client
 
@@ -93,9 +102,9 @@ work="$(mktemp -d)"
 cfg="$(printf '{"mcpServers":{"devbox":{"command":"%s","args":["--workdir-root","%s/work","--state-dir","%s/state"]}}}' \
     "$bin" "$work" "$work")"
 (cd "$work" && claude -p --mcp-config "$cfg" --strict-mcp-config \
-    --tools '' --allowedTools mcp__devbox__run_turn -- \
-    "Use the devbox run_turn tool to ask the remote agent to say hello world. \
-     Then report exactly what the tool returned (all fields), and nothing else." < /dev/null)
+    --tools '' --allowedTools mcp__devbox__session_create mcp__devbox__session_list mcp__devbox__session_send \
+        mcp__devbox__session_read mcp__devbox__session_interrupt -- \
+    "On the dev box, have the agent say hello world, and tell me exactly what it replied." < /dev/null)
 ```
 
 Running from the scratch directory keeps this repository's instructions out of the client's context, and
@@ -132,10 +141,9 @@ and were not):
   only your user can read, such as one under `$XDG_RUNTIME_DIR`. (Step 1's `devbox-mcp setup` will do this for you.)
 - `tunnel-client doctor --profile devbox --explain`, then `tunnel-client run --profile devbox`.
 - While it runs, add a custom MCP server with a Tunnel connection in
-  [ChatGPT's connector settings](https://chatgpt.com/#settings/Connectors), select the tunnel, and ask the Dot to use
-  `run_turn`. tunnel-client must be running whenever the connector is created or used.
+  [ChatGPT's connector settings](https://chatgpt.com/#settings/Connectors), select the tunnel, and ask the Dot to do
+  something on the box through it. tunnel-client must be running whenever the connector is created or used.
 
 Keep exactly one tunnel-client running per tunnel ID. tunnel-client shuts itself down when devbox-mcp exits, so a
 crashing devbox-mcp shows up as tunnel-client exiting. What response deadline the hosted relay applies has not been
-checked. If it has one, a `run_turn` that takes longer than that fails on the client side while the turn carries on and
-its result is lost, which is what the dev proxy does at its own deadline. Background turns will remove that problem.
+checked; it should not matter, since no call waits for an agent.

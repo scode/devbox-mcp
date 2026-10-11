@@ -7,12 +7,17 @@
 //! ```text
 //! cargo build
 //! cargo run --example mcp-call -- --list \
-//!     --server-arg=--workdir-root=/tmp/devbox-manual \
-//!     run_turn '{"prompt": "Say hello world and nothing else."}'
+//!     --server-arg=--workdir-root=/tmp/devbox-manual/work --server-arg=--state-dir=/tmp/devbox-manual/state \
+//!     session_create '{"name": "demo"}' \
+//!     session_send '{"name": "demo", "message": "Say hello world and nothing else."}' \
+//!     wait_turn '{"name": "demo"}'
 //! ```
 //!
-//! Several `TOOL JSON` pairs run in order against one server process. That matters once tools depend on in-process
-//! state (a turn started by one call and read by the next): separate invocations of this driver get separate servers.
+//! Several `TOOL JSON` pairs run in order against one server process. That matters because a turn runs inside the
+//! server that started it: separate invocations of this driver get separate servers, and a turn started by one dies
+//! with it. `wait_turn` is not an MCP tool but a step of this driver: it polls `session_read` once a second until the
+//! session's most recent turn has ended, and prints every event and the final turn, which is what a caller of
+//! devbox-mcp would do by hand.
 
 // Shared with the integration tests, which is why it lives under tests/. The driver uses only part of it.
 #[allow(dead_code)]
@@ -85,6 +90,38 @@ fn agent_env() -> Vec<(String, std::ffi::OsString)> {
         .collect()
 }
 
+/// The driver's `wait_turn` step: polls `session_read` for the named session until its most recent turn has ended
+/// and no more events are waiting, then returns all events seen and the final turn.
+async fn wait_turn(
+    client: &RunningService<RoleClient, ()>,
+    arguments: serde_json::Map<String, Value>,
+) -> Value {
+    let mut cursor: Option<Value> = None;
+    let mut events = Vec::new();
+    loop {
+        let mut args = arguments.clone();
+        if let Some(c) = &cursor {
+            args.insert("cursor".to_owned(), c.clone());
+        }
+        let read = match client
+            .call_tool(CallToolRequestParams::new("session_read").with_arguments(args))
+            .await
+        {
+            Ok(result) => result.structured_content.unwrap_or_default(),
+            Err(err) => return json!({ "tool": "wait_turn", "error": err.to_string() }),
+        };
+        events.extend(read["events"].as_array().cloned().unwrap_or_default());
+        cursor = Some(read["next_cursor"].clone());
+        let state = read["turn"]["state"].as_str().unwrap_or_default();
+        if !matches!(state, "running" | "interrupting") && read["more"] == false {
+            return json!({ "tool": "wait_turn", "events": events, "turn": read["turn"] });
+        }
+        if read["more"] != true {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -140,6 +177,12 @@ async fn main() -> anyhow::Result<()> {
 
     let mut failed = false;
     for (tool, arguments) in calls {
+        if tool == "wait_turn" {
+            let printed = wait_turn(&client, arguments).await;
+            failed |= printed.get("error").is_some();
+            println!("{}", serde_json::to_string_pretty(&printed)?);
+            continue;
+        }
         let result = client
             .call_tool(CallToolRequestParams::new(tool.clone()).with_arguments(arguments))
             .await;

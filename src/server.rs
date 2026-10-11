@@ -1,32 +1,24 @@
-//! The MCP tool surface devbox-mcp exposes over stdio.
+//! The MCP tool surface devbox-mcp exposes over stdio: the session tools of SPEC.md "MCP tools".
 //!
-//! The session tools of SPEC.md "MCP tools" are being added here one by one (`session_create`, `session_list` so far),
-//! next to the prototype's `run_turn`, which runs one Codex turn to completion and goes away once sessions can run
-//! turns. Each tool handler only translates between MCP and [`Sessions`]; the rules live there. SPEC_impl.md's
-//! implementation status lists what is still missing.
+//! Each tool handler only translates between MCP and [`Sessions`]; the rules live there. None of them waits for an agent
+//! (SPEC.md `BND-2`): tunnel-client forwards calls one at a time, so a waiting call would hold up every other call.
+//!
+//! Doc comments on the argument types below, and the `description` of each tool, are what a calling model reads to learn
+//! how to use devbox-mcp (SPEC.md `DOC-*`), so they are written for that model. Notes meant for developers on those
+//! types are plain `//` comments, which stay out of the schemas.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
-use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData as McpError, Json, ServerHandler, schemars, tool, tool_handler, tool_router};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
-use crate::codex::{self, Codex, Progress, TurnRequest, TurnResult};
-use crate::sessions::{SessionError, SessionPage, SessionSummary, Sessions};
+use crate::sessions::{
+    ReadResult, SendResult, SessionError, SessionPage, SessionSummary, Sessions, TurnSummary,
+};
 use crate::store::Agent;
-
-/// Server-wide settings and state, fixed at startup from the command line.
-#[derive(Clone)]
-pub struct Config {
-    pub sessions: Arc<Sessions>,
-    /// Where the prototype's `run_turn` runs when the caller names no working directory. Must be absolute.
-    pub workdir_root: PathBuf,
-    pub codex: Codex,
-}
 
 impl From<SessionError> for McpError {
     fn from(err: SessionError) -> Self {
@@ -37,8 +29,7 @@ impl From<SessionError> for McpError {
     }
 }
 
-// Arguments of `session_create`. Doc comments on schema types and their fields become JSON Schema descriptions, which
-// is text the calling model reads, so they are written for that model.
+// Arguments of `session_create`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SessionCreateParams {
     /// The new session's name: a lowercase letter, then lowercase letters, digits, `_`, or `-`; at most 64 characters.
@@ -59,46 +50,48 @@ pub struct SessionListParams {
     pub after: Option<String>,
 }
 
-// Arguments of the `run_turn` tool. Doc comments on schema types and their fields become JSON Schema descriptions,
-// which is text the calling model reads, so they are written for that model. Notes meant for developers, like this one,
-// are plain comments to keep them out of the schema.
+// Arguments of `session_send`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct RunTurnParams {
-    /// The message to send to the agent.
-    pub prompt: String,
-    /// Absolute path of the directory the agent works in. Defaults to the server's configured working directory root.
-    /// Created if it does not exist.
-    pub workdir: Option<String>,
+pub struct SessionSendParams {
+    /// The session to send to.
+    pub name: String,
+    /// What the agent should do, as you would write it to a capable colleague. At most 256 KiB.
+    pub message: String,
+    /// Optional ID you choose for this send (1 to 128 characters from A-Z, a-z, 0-9, `.`, `_`, `:`, `-`). If you are not
+    /// sure an earlier send went through (for example, its response never arrived), send again with the same ID and the
+    /// same message: you get the turn that send started instead of a second turn. Use a new ID for every new message.
+    pub request_id: Option<String>,
 }
 
-// Result of the `run_turn` tool, returned as structured content (and, by rmcp, also as JSON text for clients that
-// ignore structured content). A plain comment rather than a doc comment, for the same reason as on `RunTurnParams`.
-#[derive(Debug, Serialize, schemars::JsonSchema)]
-pub struct RunTurnResult {
-    /// True if the agent finished its turn normally.
-    pub completed: bool,
-    /// The agent's final message, if it produced one.
-    pub reply: Option<String>,
-    /// Why the turn did not complete, when it did not.
-    pub error: Option<String>,
-    /// The agent's native session ID, if it reported one.
-    pub agent_session_id: Option<String>,
-    /// The directory the agent ran in.
-    pub workdir: String,
+// Arguments of `session_read`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SessionReadParams {
+    /// The session to read.
+    pub name: String,
+    /// Where to continue from: the `cursor` from `session_send` or the `next_cursor` from your previous read. Omit it to
+    /// read from the start of the most recent turn.
+    pub cursor: Option<String>,
+}
+
+// Arguments of `session_interrupt`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SessionInterruptParams {
+    /// The session whose running turn to stop.
+    pub name: String,
 }
 
 /// The MCP server handler. Cheap to clone; rmcp clones it per request.
 #[derive(Clone)]
 pub struct DevboxServer {
-    config: Config,
+    sessions: Arc<Sessions>,
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
 impl DevboxServer {
-    pub fn new(config: Config) -> Self {
+    pub fn new(sessions: Arc<Sessions>) -> Self {
         Self {
-            config,
+            sessions,
             tool_router: Self::tool_router(),
         }
     }
@@ -106,16 +99,17 @@ impl DevboxServer {
     /// Creates a session (SPEC.md `SES-1` to `SES-3`, `SES-7`).
     #[tool(
         description = "Create a new session: a long-lived conversation with a coding agent (Codex) that runs on this \
-                       Linux box with full access to it, working in one directory. Use it once per piece of work you \
+                       Linux box with full access to it, working in one directory. Create one per piece of work you \
                        want to come back to; later messages to the same session keep the agent's context. Returns the \
                        session. Fails if the name is invalid or already taken: an existing session with that name is \
-                       shown in the error, so if it is yours, keep using it instead of creating another."
+                       shown in the error, so if it is yours, keep using it instead of creating another. Next, give \
+                       the agent work with session_send."
     )]
     async fn session_create(
         &self,
         Parameters(params): Parameters<SessionCreateParams>,
     ) -> Result<Json<SessionSummary>, McpError> {
-        Ok(Json(self.config.sessions.create(
+        Ok(Json(self.sessions.create(
             &params.name,
             params.workdir.as_deref(),
             params.agent,
@@ -133,79 +127,63 @@ impl DevboxServer {
         &self,
         Parameters(params): Parameters<SessionListParams>,
     ) -> Result<Json<SessionPage>, McpError> {
-        Ok(Json(self.config.sessions.list(params.after.as_deref())))
+        Ok(Json(self.sessions.list(params.after.as_deref())))
     }
 
-    /// Runs a single Codex turn in a fresh session and waits for it to finish.
-    ///
-    /// Caller mistakes (a relative `workdir`) are MCP errors. A turn that ran but failed is a successful call whose
-    /// result says `completed: false`, so the caller sees the agent's own error text rather than a generic tool failure.
+    /// Sends a message, starting a turn in the background (SPEC.md `TRN-1`, `TRN-2`, `TRN-6`).
     #[tool(
-        description = "Run one turn of the Codex agent on the remote box in a fresh session and return its final reply. \
-                       Blocks until the turn finishes."
+        description = "Send a message to a session's agent, starting a turn: the agent works on it in the background, \
+                       for seconds or for many minutes, and this call returns at once without waiting. Then follow the \
+                       turn with session_read, passing the returned cursor, until the turn's state is no longer \
+                       `running` or `interrupting`; the agent's reply is then in the turn's `final_message`. A session \
+                       runs one turn at a time: sending while a turn is still running fails with a 'busy' error \
+                       (wait for the turn to end, or stop it with session_interrupt). The agent remembers earlier turns \
+                       of the same session, so follow-ups can refer to earlier work."
     )]
-    async fn run_turn(
+    async fn session_send(
         &self,
-        Parameters(params): Parameters<RunTurnParams>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<Json<RunTurnResult>, McpError> {
-        let workdir = match params.workdir {
-            Some(dir) => PathBuf::from(dir),
-            None => self.config.workdir_root.clone(),
-        };
-        if !workdir.is_absolute() {
-            return Err(McpError::invalid_params(
-                format!(
-                    "workdir must be an absolute path, got {}",
-                    workdir.display()
-                ),
-                None,
-            ));
-        }
-        std::fs::create_dir_all(&workdir).map_err(|e| {
-            McpError::internal_error(
-                format!("cannot create workdir {}: {e}", workdir.display()),
-                None,
-            )
-        })?;
+        Parameters(params): Parameters<SessionSendParams>,
+    ) -> Result<Json<SendResult>, McpError> {
+        Ok(Json(self.sessions.send(
+            &params.name,
+            &params.message,
+            params.request_id.as_deref(),
+        )?))
+    }
 
-        let req = TurnRequest {
-            prompt: &params.prompt,
-            workdir: &workdir,
-            model: codex::DEFAULT_MODEL,
-            effort: codex::DEFAULT_EFFORT,
-            resume: None,
-        };
-        let mut native_id = None;
-        // rmcp does not drop a handler's future when the client cancels the call; it only cancels this token. Dropping
-        // the turn is what kills the agent, so racing the two is what makes a cancelled call stop its agent (`LIF-1`).
-        let outcome = tokio::select! {
-            outcome = self.config.codex.run_turn(
-                &req,
-                |progress| {
-                    if let Progress::NativeId(id) = progress {
-                        native_id = Some(id);
-                    }
-                },
-                std::future::pending(),
-            ) => outcome,
-            _ = ctx.ct.cancelled() => {
-                return Err(McpError::internal_error("run_turn was cancelled by the client", None));
-            }
-        }
-        .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
-        let (completed, error) = match outcome.result {
-            TurnResult::Completed => (true, None),
-            TurnResult::Failed { error } => (false, Some(error)),
-            TurnResult::Interrupted => (false, Some("the turn was interrupted".to_owned())),
-        };
-        Ok(Json(RunTurnResult {
-            completed,
-            reply: outcome.final_message,
-            error,
-            agent_session_id: native_id,
-            workdir: workdir.display().to_string(),
-        }))
+    /// Reads a session's events after a cursor (SPEC.md `TRN-3`, `TRN-7`).
+    #[tool(
+        description = "Read what has happened in a session since your cursor: the agent's messages, the commands it \
+                       ran with their output, the files it changed, errors, and the end of the turn, plus the current \
+                       state of the most recent turn and whether the agent is still alive. Returns immediately with \
+                       what is there; it never waits. Pass `next_cursor` from one read as `cursor` to the next to get \
+                       only new events. If `more` is true, read again right away. While the turn is still running, \
+                       read again later (every few seconds at most, or after doing other work); turns often take \
+                       minutes. If `gap` is true, some events are missing (for example after devbox-mcp restarted), \
+                       but the turn's state is still current."
+    )]
+    async fn session_read(
+        &self,
+        Parameters(params): Parameters<SessionReadParams>,
+    ) -> Result<Json<ReadResult>, McpError> {
+        Ok(Json(
+            self.sessions.read(&params.name, params.cursor.as_deref())?,
+        ))
+    }
+
+    /// Starts interrupting a running turn (SPEC.md `TRN-4`).
+    #[tool(
+        description = "Stop a session's running turn. Returns at once with the turn in state `interrupting`; the agent \
+                       and everything it started are then killed, and the turn becomes `interrupted` once they are \
+                       gone (follow it with session_read). If the agent happened to finish just before, the turn keeps \
+                       its own outcome. If no turn is running, nothing changes and the most recent turn is returned. \
+                       Work the agent already did (file changes, for example) is not undone."
+    )]
+    async fn session_interrupt(
+        &self,
+        Parameters(params): Parameters<SessionInterruptParams>,
+    ) -> Result<Json<TurnSummary>, McpError> {
+        Ok(Json(self.sessions.interrupt(&params.name)?))
     }
 }
 
@@ -216,8 +194,15 @@ impl ServerHandler for DevboxServer {
             // Not `Implementation::from_build_env()`: that macro expands inside rmcp and reports rmcp's own name and version.
             .with_server_info(Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "devbox-mcp runs coding agents on a remote Linux box. This is an early prototype with a single tool, \
-                 run_turn, which runs one Codex turn and returns its reply.",
+                "devbox-mcp runs coding agents (Codex) on a remote Linux box, with full access to it, on your behalf. \
+                 Work happens in sessions: a session is a long-lived conversation with one agent, working in one \
+                 directory, that you can come back to later with its context intact. Typical use: session_create once, \
+                 then session_send a message (it returns at once; the agent works in the background), then \
+                 session_read with the returned cursor, repeatedly, until the turn's state is neither `running` nor \
+                 `interrupting` and `more` is false; the agent's reply is the turn's `final_message`. Send follow-ups to the same session. No call ever waits \
+                 for the agent, so pace your reads (every few seconds at most, or after doing other work), and expect \
+                 long turns to take minutes. Use session_list to find earlier sessions, and session_interrupt to stop \
+                 a turn.",
             )
     }
 }

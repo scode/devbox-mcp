@@ -43,6 +43,8 @@ pub enum TurnState {
 }
 
 impl TurnState {
+    /// Whether the turn has ended for good. `Running` and `Interrupting` never survive a restart: loading maps them to
+    /// `Lost`.
     pub fn is_terminal(self) -> bool {
         !matches!(self, TurnState::Running | TurnState::Interrupting)
     }
@@ -59,10 +61,25 @@ pub struct TurnRecord {
     pub final_message: Option<String>,
     #[serde(default)]
     pub final_message_truncated: bool,
-    /// Why a failed turn failed, at most 4 KiB.
+    /// Why a failed turn failed, at most 4 KiB, ending in `sessions::CUT_MARK` when cut.
     pub error: Option<String>,
     #[serde(default)]
     pub cleanup_uncertain: bool,
+}
+
+/// A request ID a session has accepted, kept for the session's whole life so a retry is recognized however late it
+/// comes (`TRN-6`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptedRequest {
+    pub request_id: String,
+    /// Hex SHA-256 of the message, to recognize a reuse of the ID with a different message. SHA-256 rather than Rust's
+    /// built-in hasher, whose output may change between Rust releases and would then reject legitimate retries.
+    pub message_sha256: String,
+    pub turn_id: u64,
+    /// Whether that turn started a fresh agent conversation, so a retry reports the reset too: it cannot be
+    /// reconstructed later, once the fresh conversation has a native ID.
+    #[serde(default)]
+    pub context_reset: bool,
 }
 
 /// One session's durable state, as stored in `<state-dir>/sessions/<name>.json`.
@@ -76,6 +93,9 @@ pub struct Record {
     /// The agent's own session ID once it has reported one; needed to resume the conversation (`SES-5`).
     pub native_id: Option<String>,
     pub turn: Option<TurnRecord>,
+    /// Every request ID accepted for this session (absent in records written before request IDs existed).
+    #[serde(default)]
+    pub requests: Vec<AcceptedRequest>,
 }
 
 /// The state directory: its lock and its session records.

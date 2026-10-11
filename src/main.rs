@@ -25,7 +25,8 @@ use tokio::signal::unix::{SignalKind, signal};
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Args {
-    /// Directory turns run in when the caller names none. Defaults to ~/devbox-mcp/work. Must be absolute.
+    /// Root of the default session working directories: a session named `foo` works in `<root>/foo` unless its creator
+    /// names another directory. Defaults to ~/devbox-mcp/work. Must be absolute.
     #[arg(long)]
     workdir_root: Option<PathBuf>,
 
@@ -87,18 +88,15 @@ fn main() -> anyhow::Result<()> {
     // Opened before the runtime starts: taking the lock may wait for a previous devbox-mcp to exit, and blocking is
     // fine here.
     let store = store::Store::open(&state_dir)?;
-    let config = server::Config {
-        sessions: Arc::new(sessions::Sessions::new(
-            store,
-            sessions::Config {
-                workdir_root: workdir_root.clone(),
+    let sessions = Arc::new(sessions::Sessions::new(
+        store,
+        sessions::Config {
+            workdir_root,
+            codex: codex::Codex {
+                bin: args.codex_bin,
             },
-        )?),
-        workdir_root,
-        codex: codex::Codex {
-            bin: args.codex_bin,
         },
-    };
+    )?);
 
     // A current-thread runtime is load-bearing: agent children get a parent-death signal, which Linux ties to the
     // thread that spawned them. With one thread, that is the main thread, which lives exactly as long as the process.
@@ -107,9 +105,9 @@ fn main() -> anyhow::Result<()> {
         .enable_all()
         .build()
         .context("cannot start tokio runtime")?;
-    let result = runtime.block_on(serve(config));
-    // Shutting the runtime down drops every in-flight tool call, and dropping a call kills its agent and everything the
-    // agent started (`LIF-1`).
+    let result = runtime.block_on(serve(sessions));
+    // Shutting the runtime down drops every task, running turns included, and dropping a turn's task kills its agent and
+    // everything the agent started (`LIF-1`).
     runtime.shutdown_timeout(BLOCKING_SHUTDOWN_TIMEOUT);
     result
 }
@@ -120,11 +118,11 @@ fn main() -> anyhow::Result<()> {
 /// left to kill the process outright: tunnel-client stops its child by closing stdin *and* sending SIGTERM, and with the
 /// default disposition the agents' own children would outlive devbox-mcp. The signals are watched during MCP
 /// initialization too, since a client that never finishes initializing must not make devbox-mcp unstoppable.
-async fn serve(config: server::Config) -> anyhow::Result<()> {
+async fn serve(sessions: Arc<sessions::Sessions>) -> anyhow::Result<()> {
     let mut sigterm = signal(SignalKind::terminate()).context("cannot install SIGTERM handler")?;
     let mut sigint = signal(SignalKind::interrupt()).context("cannot install SIGINT handler")?;
 
-    let server = server::DevboxServer::new(config);
+    let server = server::DevboxServer::new(sessions);
     let service = tokio::select! {
         service = server.serve(rmcp::transport::stdio()) => service.context("MCP initialization failed")?,
         _ = sigterm.recv() => return Ok(()),

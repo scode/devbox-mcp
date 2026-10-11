@@ -13,7 +13,8 @@ use std::time::Duration;
 use serde_json::json;
 use support::dev_proxy::{DevProxy, default_tunnel_client};
 use support::{
-    DEVBOX_MCP, Harness, assert_all_gone, hermetic_env, run_turn, send_signal, structured,
+    DEVBOX_MCP, Harness, assert_all_gone, call, hermetic_env, run_session_turn, send_signal,
+    structured,
 };
 
 /// Starts devbox-mcp on this harness behind the pinned tunnel-client.
@@ -30,20 +31,55 @@ async fn start_proxy(h: &Harness) -> DevProxy {
     .unwrap()
 }
 
-/// Spec (`TSP-1`): devbox-mcp works as a stdio server started by tunnel-client. A turn goes through tunnel-client's
-/// real request path and comes back with the agent's reply.
+/// Spec (`TSP-1`): devbox-mcp works as a stdio server started by tunnel-client. A whole session flow (create, send,
+/// read until the end) goes through tunnel-client's real request path and comes back with the agent's reply.
 #[tokio::test]
 async fn runs_a_turn_through_tunnel_client() {
     let h = Harness::new();
     let proxy = start_proxy(&h).await;
     let client = proxy.connect().await.unwrap();
 
-    let tools = client.list_all_tools().await.unwrap();
-    assert!(tools.iter().any(|t| t.name == "run_turn"));
-    let result = run_turn(&client, json!({ "prompt": "say hello world" })).await;
-    let out = structured(&result);
-    assert_eq!(out["completed"], true);
-    assert_eq!(out["reply"], "fake reply: say hello world");
+    let (_, last) = run_session_turn(&client, "alpha", "say hello world").await;
+    assert_eq!(last["turn"]["state"], "completed");
+    assert_eq!(last["turn"]["final_message"], "fake reply: say hello world");
+    client.cancel().await.unwrap();
+}
+
+/// Spec (`BND-2`, `TRN-1`): tunnel-client forwards calls to devbox-mcp one at a time, so a call that waited for an
+/// agent would hold up every other call. With a turn running indefinitely, other calls (here a listing, a read, and
+/// an interrupt) still come back promptly through the real tunnel-client.
+#[tokio::test]
+async fn a_running_turn_does_not_hold_up_other_calls() {
+    let h = Harness::new();
+    let proxy = start_proxy(&h).await;
+    let client = proxy.connect().await.unwrap();
+    call(&client, "session_create", json!({ "name": "alpha" }))
+        .await
+        .unwrap();
+    call(
+        &client,
+        "session_send",
+        json!({ "name": "alpha", "message": "hang" }),
+    )
+    .await
+    .unwrap();
+    let pids = h.hanging_agent_pids().await;
+
+    for (tool, args) in [
+        ("session_list", json!({})),
+        ("session_read", json!({ "name": "alpha" })),
+        ("session_interrupt", json!({ "name": "alpha" })),
+    ] {
+        let started = std::time::Instant::now();
+        let result = call(&client, tool, args).await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{tool} took {:?} while a turn was running",
+            started.elapsed()
+        );
+        assert_ne!(structured(&result), serde_json::Value::Null);
+    }
+    assert_all_gone(&pids, "agent survived an interrupt through tunnel-client").await;
     client.cancel().await.unwrap();
 }
 
@@ -56,10 +92,16 @@ async fn stopping_tunnel_client_stops_devbox_mcp_and_the_agent() {
     let mut proxy = start_proxy(&h).await;
     let client = proxy.connect().await.unwrap();
 
-    let peer = client.peer().clone();
-    let params = rmcp::model::CallToolRequestParams::new("run_turn")
-        .with_arguments(json!({ "prompt": "hang" }).as_object().unwrap().clone());
-    let _call = tokio::spawn(async move { peer.call_tool(params).await });
+    call(&client, "session_create", json!({ "name": "alpha" }))
+        .await
+        .unwrap();
+    call(
+        &client,
+        "session_send",
+        json!({ "name": "alpha", "message": "hang" }),
+    )
+    .await
+    .unwrap();
     let mut pids = h.hanging_agent_pids().await;
     // The fake agent's parent is devbox-mcp itself.
     pids.push(h.recorded("ppid").trim().parse().unwrap());
