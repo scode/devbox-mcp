@@ -62,7 +62,7 @@ the signal that devbox-mcp did not die in the meantime. The kernel ties that sig
 child, not the process, which is why devbox-mcp runs a current-thread tokio runtime: every child is spawned from the
 main thread.
 
-Known gaps, both of which need a cgroup per agent to close:
+Known gaps, both of which need a cgroup per agent to close (tracked in [TODO.md](TODO.md)):
 
 - If devbox-mcp dies abruptly (SIGKILL, a crash), the parent-death signal reaches only the agent process itself, and
   Codex's own parent-death signal only its direct children. Anything further down may outlive it.

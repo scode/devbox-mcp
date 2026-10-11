@@ -52,6 +52,12 @@ Rules:
 - The summary after the colon is lowercase, imperative mood, no trailing period.
 - Keep the first line under 72 characters.
 
+## TODO.md
+
+[TODO.md](TODO.md) is where we keep work items the user has asked to have tracked. Add an item only when the user asks
+for it; do not populate it on your own initiative, even with gaps you found yourself (mention those to the user
+instead). Removing or updating an item as part of finishing that work is fine.
+
 ## Lore
 
 The ./lore directory contains historical information about the project. Only use it for historical digging or when
