@@ -6,14 +6,13 @@ agreement.
 
 ## Implementation status
 
-The code is an early prototype, part way through step 2 of the roadmap in TODO.md. Implemented: the stdio transport and
-the security posture (`SEC-*`, `TSP-1`), `LIF-1` for orderly shutdowns, sessions (`SES-*` except removal) with the Codex
-adapter and a model and effort chosen at creation, the session store of "Storage", and turns (`TRN-*`) with "Turn
-lifecycle", "Turn events", cursors, request IDs, liveness, and the bounds of `BND-*`, through the five session tools.
+The code is an early prototype that implements steps 1 and 2 of the roadmap in TODO.md. Implemented: the stdio transport
+and the security posture (`SEC-*`, `TSP-1`), `LIF-1` for orderly shutdowns, sessions (`SES-*`) with the Codex adapter, a
+model and effort chosen at creation, and removal, the session store of "Storage", and turns (`TRN-*`) with "Turn
+lifecycle", "Turn events", cursors, request IDs, liveness, and the bounds of `BND-*`, through the six session tools.
 
-Not yet implemented: transcripts (`TRA-*`) and session removal (`SES-1`, `SES-6`), which is specified below for step 2
-of the roadmap in TODO.md. "Deployment" is implemented by `devbox-mcp setup`; [docs/deployment.md](docs/deployment.md)
-is the guide.
+Not yet implemented: transcripts (`TRA-*`). "Deployment" is implemented by `devbox-mcp setup`;
+[docs/deployment.md](docs/deployment.md) is the guide.
 
 ## Language and dependencies
 
@@ -117,6 +116,8 @@ missing conversation fails.
 A record also says whether an earlier conversation of the session was never tracked. That is set when a send starts a
 fresh conversation because the previous one could not be resumed (`context_reset`, `SES-5`): the agent may have stored
 that earlier conversation, but devbox-mcp never learned its ID, so it cannot delete it, and removal requires `force`.
+Records written before this was tracked lack it; for them nobody knows, so a session past its first turn is treated as
+possibly having such a conversation (a reset needs an earlier turn), and one still at its first turn as not having one.
 
 Records are read at startup. A most recent turn still recorded as `running` or `interrupting` is reported as `lost`
 (`TRN-5`); the file itself is updated with the session's next write. A record that cannot be parsed is left untouched, a
@@ -175,7 +176,7 @@ as MCP structured content and, for clients that ignore that, as the same JSON as
   Removal deletes the agent's data first and the record second. The session stays in memory until its record is gone, so
   a failure at any point leaves it listed; the error says that the agent may already have deleted part of its data,
   which then stays deleted, and a later send fails the way a resume of a missing conversation fails. Failure output from
-  the agent's delete command is cut to 2 KiB.
+  the agent's delete command is cut to 2 KiB, ending in ` [cut]` when it was longer.
 - While the agent's data is being deleted, the session is marked as being removed, in memory only. New sends and other
   removals fail as busy; a send that repeats a known request ID is still replayed first, as above. The mark is set in
   the same step as the busy check and cleared once the deletion has finished or failed.
@@ -275,7 +276,9 @@ Two checks keep it honest:
   - a send to a busy session (it should wait for the turn or interrupt it, not resend blindly);
   - a failed turn (it should report the failure and its reason);
   - interrupting a long turn and confirming it stopped;
-  - coming back after devbox-mcp restarted (it should notice the lost turn or gap and carry on).
+  - coming back after devbox-mcp restarted (it should notice the lost turn or gap and carry on);
+  - removing a session whose turn is still running (it should stop the turn and then remove the session, without
+    reaching for `force`).
 
   Misuse is fixed by improving the descriptions, not the prompts. The check records which parts of the server's
   self-description the client actually showed the model. It is run whenever tools or their descriptions change, and its
@@ -336,11 +339,12 @@ The Codex adapter uses non-interactive mode, checked against codex-cli 0.162.1:
   turn's failure reason.
 - Removing a session's data: `codex delete --force <native session ID>`, run with the same environment as the turns, so
   it uses the same Codex home. It deletes the rollout file and Codex's database rows for the session (checked with
-  0.162.1). On a timeout of 10 seconds the command is killed and reaped before the removal fails, so it can never delete
-  anything after the session is back in use. Any failure is a failure of the removal: Codex reports an already deleted
-  session with the same message and exit status as a real failure, and a failure can come after part of the data is
-  already deleted (the rollout before the database rows), so devbox-mcp does not try to tell these apart and leaves the
-  decision to the caller's `force`.
+  0.162.1). On a timeout of 10 seconds the command's whole process group is killed and the command reaped before the
+  removal fails, so it can never delete anything after the session is back in use. The group matters because `codex` may
+  be a launcher, such as the npm package's script, that starts the deleting process as its child. Any failure is a
+  failure of the removal: Codex reports an already deleted session with the same message and exit status as a real
+  failure, and a failure can come after part of the data is already deleted (the rollout before the database rows), so
+  devbox-mcp does not try to tell these apart and leaves the decision to the caller's `force`.
 - The native transcript is a rollout file under Codex's home directory (`$CODEX_HOME`, by default `~/.codex`), at
   `sessions/YYYY/MM/DD/rollout-<timestamp>-<session id>.jsonl`. Codex compresses old rollouts to `.jsonl.zst` and
   removes the plain file, so reading or deleting a session's native data (steps 2 and 4 in TODO.md) must handle both.

@@ -483,7 +483,7 @@ impl<T> Drop for AbortOnDrop<T> {
 
 /// Reads at most `limit` bytes of a stream as lossy UTF-8, then keeps draining (and discarding) the rest so the writer
 /// never blocks on a full pipe.
-async fn read_bounded(mut reader: impl tokio::io::AsyncRead + Unpin, limit: usize) -> String {
+pub async fn read_bounded(mut reader: impl tokio::io::AsyncRead + Unpin, limit: usize) -> String {
     let mut kept = Vec::new();
     let mut buf = [0u8; 4096];
     loop {
