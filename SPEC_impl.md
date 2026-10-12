@@ -17,6 +17,10 @@ and are read incrementally (`TRN-*`; `run_turn` blocks instead), transcripts (`T
 `run_turn` goes away once sessions exist. Of the configuration flags below, only `--workdir-root` and `--codex-bin`
 exist so far, and `--workdir-root` is currently used directly as the default working directory.
 
+Step 1 of the roadmap in TODO.md is specified but not implemented: SPEC.md's "Self-documentation" and "MCP tools", and
+here "Storage", "Tools", "Turn lifecycle", "Self-documentation", "Turn events", the Codex event mapping, and
+"Deployment".
+
 ## Language and dependencies
 
 devbox-mcp is a single Rust binary (edition 2024) using tokio and [rmcp](https://crates.io/crates/rmcp), the official
@@ -38,15 +42,17 @@ tunnel-client forwards requests to its stdio child one at a time, and gives up o
 dev proxy defaults to 30 seconds; what the hosted relay applies has not been checked). Observed with tunnel-client
 v0.0.16: a tool call that outlives the deadline fails on the client side while devbox-mcp keeps working on it, and every
 other call queued behind it times out too. So every tool call must return quickly no matter how long the agent works,
-which is the practical reason behind `TRN-1` and `BND-1`, and long-polling reads must wait well under the deadline.
+which is the practical reason behind `TRN-1`, `BND-1`, and `BND-2`.
 
 tunnel-client stops its child by closing the child's stdin and sending it SIGTERM, and a service manager may send
 SIGTERM to every process of a service at once, with stdin still open. devbox-mcp treats stdin reaching end of file,
 SIGTERM, and SIGINT alike as a request for an orderly shutdown, including while MCP initialization is still in progress.
-It shuts its tokio runtime down, which drops every in-flight tool call, and dropping a call kills its agent. The
-runtime's shutdown waits at most a second for blocking threads, because rmcp's stdin reader stays blocked in `read` for
-as long as stdin is open. A tool call the client cancels (`notifications/cancelled`) is dropped the same way; rmcp only
-signals the cancellation, so the handler races its work against it.
+It shuts its tokio runtime down, which drops every in-flight task, and dropping the task that owns an agent kills the
+agent. The runtime's shutdown waits at most a second for blocking threads, because rmcp's stdin reader stays blocked in
+`read` for as long as stdin is open. A tool call the client cancels (`notifications/cancelled`) is dropped too; rmcp
+only signals the cancellation, so the handler races its work against it. In the prototype the agent belongs to the
+`run_turn` call, so cancelling the call kills it. With sessions, a turn belongs to its session, not to any call, and
+cancelling a call never affects it (see "Turn lifecycle").
 
 Each turn is an agent child process started with an argument array, never a shell string, in its own process group.
 Killing that group is not enough: Codex runs every shell command in a new session, so a command's own children are in
@@ -92,23 +98,191 @@ environment variables:
 
 ## Storage
 
-Session records (name, agent, working directory, model and effort, and the agent's native session ID once known) are
-stored one JSON file per session under the state directory, written atomically by writing a temporary file and renaming
-it into place. That is enough to resume sessions after a restart (`SES-5`).
+Each session is one JSON file, `<state-dir>/sessions/<name>.json`. It holds:
 
-Turn events are kept in memory only, since a turn cannot outlive the process anyway. After a restart, a session whose
-last turn never recorded an end reports that turn as lost (`TRN-5`). The durable record of what happened is the agent's
-own transcript, which is also what transcript reads return (`TRA-2`).
+- the name, agent, working directory, model and effort, and the agent's native session ID once known (`SES-5`);
+- the most recent turn (`SES-8`): its ID (turn IDs count up from 1 within a session), its state, when it started and
+  ended, the agent's final message (at most 32 KiB, cut with a `final_message_truncated` flag), and, for a failed turn,
+  the error that ended it (at most 4 KiB);
+- every request ID the session has accepted (`TRN-6`), each with a SHA-256 of its message and the turn it started. They
+  are kept for the session's whole life, so a retry is recognized however late it comes; each costs about a hundred
+  bytes per turn. (SHA-256 rather than Rust's built-in hasher, whose output may change between Rust releases and would
+  then reject legitimate retries after an upgrade.)
+
+Every change rewrites the whole record synchronously: write a temporary file with a fixed name next to it, `fsync` it,
+and rename it over the record. The runtime is single-threaded and a write has no `.await` in it, so two writes can never
+interleave and no further coordination is needed. A send is accepted only once its record (the new turn in state
+`running` and its request ID) is on disk, before the agent is started and before the send returns; if that write fails,
+the send fails and nothing runs. If a later write fails, the call or turn that made it reports the error, memory keeps
+the correct state, and the next successful write of that session brings the file up to date.
+
+Records are read at startup. A most recent turn still recorded as `running` or `interrupting` is reported as `lost`
+(`TRN-5`); the file itself is updated with the session's next write. A record that cannot be parsed is left untouched, a
+warning naming it goes to stderr, it is left out of `session_list`, and creating a session with that name fails with an
+error saying an unreadable record is in the way.
+
+devbox-mcp holds an exclusive lock (`flock`) on `<state-dir>/lock` for as long as it runs, so two instances can never
+share a state directory. tunnel-client may start a new devbox-mcp while the previous one is still shutting down, so a
+new instance waits up to 10 seconds for the lock before giving up with an error. A file lock is not a listener.
+
+Turn events are kept in memory only, since a turn cannot outlive the process anyway: the events of each session's most
+recent turn, at most 10,000 of them, after which the oldest are dropped (a read that asks for them gets a gap, `TRN-3`).
+Since every text field is already cut when its event is created (see "Tools"), that count also bounds the memory. The
+durable record of what happened is the agent's own transcript (`TRA-2`).
+
+## Tools
+
+The tools named in SPEC.md, as they are implemented. Argument and result fields are JSON; every result is returned both
+as MCP structured content and, for clients that ignore that, as the same JSON as text.
+
+- `session_create { name, workdir?, agent? }`: `workdir` defaults to `<workdir-root>/<name>` and must be absolute. It is
+  created with its parents if missing; if it exists it must be a directory (symlinks are followed). The session exists
+  once its record is on disk; a directory created before a failure is left in place. `agent` must be `codex`. Returns a
+  session summary. On a name collision, the error message includes the existing session's summary.
+- `session_list { after? }`: returns `{ sessions: [summary], next_after? }`: at most 50 sessions in name order, starting
+  after the name `after`; `next_after` is present when more follow. A summary is `{ name, agent, workdir, turn }`, where
+  `turn` is the most recent turn as `{ id, state, started_at, ended_at?, final_message_preview?,
+  final_message_truncated?, error? }` with a preview of at most 2 KiB, or null before the first turn.
+- `session_send { name, message, request_id? }`: `message` is at most 256 KiB; `request_id` is 1 to 128 characters from
+  `A-Z a-z 0-9 . _ : -`. Checked in this order: unknown session, then a known request ID (same message: return the
+  original turn with `replayed: true`, whatever the session is doing; different message: error), then busy, then a
+  record write failure. Returns `{ turn_id, replayed, cursor?, context_reset }`; `cursor` points just before the turn's
+  first event and is omitted when those events are no longer held (a replay of an older turn, or after a restart).
+  `context_reset` is true when this turn starts a fresh agent conversation because the old one could not be resumed
+  (`SES-5`).
+- `session_read { name, cursor? }`: returns `{ events, next_cursor, more, gap, turn, liveness: { agent_alive,
+  last_event_age_seconds, turn_duration_seconds } }`. `turn` is the most recent turn as in a summary, but with the full
+  stored `final_message`. `gap` is true when events may be missing between the cursor and the first event returned.
+  `more` is true when the response hit its bounds and further events are already waiting. Liveness values are null when
+  unknown: `agent_alive` when there is no running turn, `last_event_age_seconds` when no event is held,
+  `turn_duration_seconds` when a lost turn's end is unknown; for a running turn `turn_duration_seconds` is the time
+  since it started, for an ended one the time it ran. Times are RFC 3339 timestamps in UTC; durations are whole seconds.
+- `session_interrupt { name }`: returns the most recent turn as in a summary, normally with state `interrupting`.
+
+Cursors are opaque strings that encode the session name, an ID of the devbox-mcp process that issued them (random at
+startup), and the sequence number of the last event the caller has seen (0 for "before the first event"). Event sequence
+numbers count up from 1 within a session and process, across turns. Reads have two outcomes for a cursor:
+
+- one that cannot be parsed, or that belongs to another session, is an error naming the problem;
+- one that cannot otherwise be honored (from another process, older than the oldest event still held, or beyond the
+  newest event) gives `gap: true` and continues from the oldest event held.
+
+Without a cursor, a read starts at the first event of the most recent turn, with `gap: true` if that is no longer held.
+With no events after the cursor, `events` is empty and `next_cursor` equals the cursor.
+
+Bounds per `BND-1` hold by construction rather than by measuring responses. Every text field of an event is cut when the
+event is created: to its last 8 KiB for command output, its first 8 KiB otherwise, never splitting a UTF-8 character,
+with a `truncated` flag on the event; a `file_change` lists at most 50 changes, also flagged. A read returns at most 50
+events and sets `more` when others are waiting. With every event bounded, a read's size is bounded too (roughly 50
+events of at most a few tens of KiB each, plus the turn's stored final message), and paging always advances. Lines of
+agent output are read whole; the agent is trusted under the security model, so an absurdly long line costs memory,
+nothing more.
+
+No call waits on an agent or on a background task (`BND-2`): each one reads or updates in-memory state and, at most,
+writes one session record. There is no fixed time limit beyond that; a call that cannot make progress because the disk
+is stuck is a failure of the box, not something devbox-mcp can bound.
+
+## Turn lifecycle
+
+A turn is a background task owned by its session, not by the call that started it, so cancelling or losing a tool call
+never affects an accepted turn (`TRN-1`). Its states:
+
+- `running` from acceptance until the agent's exit is observed, or until an interrupt is accepted;
+- `interrupting` from an accepted interrupt until the agent and its process tree have been killed (see "Process model")
+  and the agent reaped. The tree walk sleeps while it waits for processes to stop, so it runs on a blocking thread,
+  never on the runtime's only thread, where it would stall every other call;
+- then exactly one terminal state: `completed`, `failed`, or `interrupted`, or `lost` if devbox-mcp restarted first.
+
+Which terminal state follows depends on what came first. An interrupt accepted before the agent's exit was observed
+makes the turn `interrupted`, even if the agent was finishing at the same moment. Otherwise the agent's own report
+decides, by the same rule as the prototype: `completed` only if the agent reported completion, did not report failure,
+and exited successfully; `failed` in every other case, including an agent that could not be started, with the reason
+recorded. If the process-tree walk hit its bounds (a process that did not stop in time, or the generation limit),
+cleanup cannot be confirmed, and the terminal state carries `cleanup_uncertain: true` (`TRN-4`, `LIF-2`).
+
+The turn ends only once all of this is settled: the agent exited or was killed and reaped, its output pipes were drained
+(at most two seconds after its exit), the `turn_ended` event was published, and the record was written. Until then the
+session counts as busy (`TRN-2`), so a new turn can never receive an old turn's late output.
+
+A non-JSON or unrecognized line of agent output does not end the turn; it becomes an `error` event and the turn goes on.
+
+If the first turn of a session was lost before the agent reported its native session ID, the agent's conversation may
+exist but cannot be found. That is recognizable from the record alone (no native session ID, but an earlier turn), so no
+extra state is kept: the next send starts a fresh agent conversation and reports `context_reset: true` (`SES-5`). When a
+resumed turn reports a native session ID different from the stored one, the turn fails with an error rather than
+continuing a different conversation.
+
+When devbox-mcp shuts down, every session's running turn is killed as before (`LIF-1`) and is reported as `lost` by the
+next instance.
+
+## Self-documentation
+
+The `DOC-*` requirements are met through the three places MCP lets a server describe itself: the server instructions
+returned at initialization, each tool's description, and the JSON Schemas of each tool's arguments and results. rmcp
+builds those schemas from the Rust types, turning doc comments on fields into schema descriptions, so field doc comments
+on tool types are written for the calling model; notes meant for developers on those types are plain `//` comments. The
+text is written for a capable agent that knows nothing about devbox-mcp: concrete, with the workflow spelled out, and
+never relying on SPEC.md or this repository. Because a client may not show a model everything (the server instructions
+or output schemas in particular), anything a caller must know to use a tool correctly is also in that tool's
+description.
+
+The instructions tell callers how to poll: there is no way to wait inside devbox-mcp, so a caller with nothing else to
+do should space out reads (for example, check back after doing other work, or every few seconds at most) rather than
+read in a tight loop, and should expect long turns to take minutes.
+
+Two checks keep it honest:
+
+- An automated test lists the tools over MCP and fails if the server instructions are empty, if any tool lacks a
+  description, or if any property in any argument or result schema lacks one. It simply visits every JSON object
+  anywhere in each schema and checks every entry of each `properties` map, so nested types and definitions are covered
+  without resolving references. This catches omissions, not bad writing.
+- A manual "cold agent" check, using the model-as-client layer in docs/testing.md. A real model gets only devbox-mcp's
+  tools and tasks phrased the way a user would give them to a Dot, with no hints about tool names, polling, or cursors,
+  and must handle each correctly within a bounded number of calls:
+  - create a session, send work, follow the turn to its end, report the result, then continue the same session;
+  - a send to a busy session (it should wait for the turn or interrupt it, not resend blindly);
+  - a failed turn (it should report the failure and its reason);
+  - interrupting a long turn and confirming it stopped;
+  - coming back after devbox-mcp restarted (it should notice the lost turn or gap and carry on).
+
+  Misuse is fixed by improving the descriptions, not the prompts. The check records which parts of the server's
+  self-description the client actually showed the model. It is run whenever tools or their descriptions change, and its
+  outcome is reported with the change. It does not replace trying the real thing with a Dot through the tunnel, which is
+  the user's to do.
+
+## Turn events
+
+Events are agent-agnostic. Each has a `seq`, a `turn_id`, a `time`, a `type`, and, when it was cut down, `truncated`:
+
+- `turn_started { message }`, with the message cut like any text field;
+- `agent_message { text }`;
+- `command_started { item_id, command }` and `command_finished { item_id, command, status, exit_code, output }`, where
+  `status` is `completed`, `failed`, or `declined`, `exit_code` is null when the command did not run to an exit, and
+  `output` is the end of its combined output; `item_id` pairs the two;
+- `file_change { item_id, status, changes: [{ path, kind }] }`, where `status` says whether the change was applied
+  (`completed`) or not (`failed`);
+- `tool { item_id, name, status }` for other agent tool use the adapter recognizes but has no specific event for, and
+  for item types it does not recognize, named after the type;
+- `error { message, fatal }` for errors the agent or devbox-mcp reports during the turn; `fatal` is true for the one
+  that ended it;
+- `turn_ended { state, error?, cleanup_uncertain? }`, always the last event of a turn. The final message is not repeated
+  here; it is in the `turn` returned with every read.
+
+The agent's reasoning is not passed through.
 
 ## Agent adapters
 
-Everything agent-specific lives behind an adapter interface, so adding Claude or another agent means adding an adapter
-and not touching the session logic. An adapter knows how to:
+Everything agent-specific stays in that agent's module, so adding Claude or another agent means adding a module and not
+touching the session logic. An agent's module knows how to:
 
 - build the command line for a first turn and for a resumed turn, with permissions fully disabled (`SEC-4`);
 - turn the agent's output stream into devbox-mcp's turn events, and extract the agent's native session ID;
-- locate and read the agent's native transcript for a session;
-- delete the agent's stored data for a session (`SES-6`).
+- locate and read the agent's native transcript for a session (step 4 in TODO.md);
+- delete the agent's stored data for a session (`SES-6`, step 2).
+
+With only Codex so far, the boundary is simply `codex.rs`'s functions: no trait, no dynamic dispatch, and nothing for
+the later steps until they are built. The shape of a shared interface is decided when the second agent arrives (step 3),
+from two real examples instead of one guess.
 
 ### Codex
 
@@ -118,15 +292,74 @@ The Codex adapter uses non-interactive mode, checked against codex-cli 0.162.1:
   <model> -c model_reasoning_effort="<effort>" -`, with the message on stdin.
 - Later turns: `codex exec resume --json` with the same permission, model, and effort flags, then the native session ID
   and `-`, again with the message on stdin and the child's working directory set to the session's.
+- The bypass flag turns off Codex's sandbox and approvals but leaves the user's own execution-policy rules in force; per
+  `SEC-4`, devbox-mcp deliberately does not pass `--ignore-rules`. A command those rules reject shows up as a declined
+  or failed command in the turn's events.
 - The native session ID is the `thread_id` of the `thread.started` event, recorded as soon as it is seen. Never use
   `--last`, which picks whatever session ran most recently.
 - `--skip-git-repo-check` is needed because Codex otherwise refuses to run outside a git repository, and session working
   directories need not be repositories.
 - Defaults: model `gpt-6.1-sol`, reasoning effort `high`.
-- The native transcript is the rollout file `~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<session id>.jsonl`.
+- The native transcript is a rollout file under Codex's home directory (`$CODEX_HOME`, by default `~/.codex`), at
+  `sessions/YYYY/MM/DD/rollout-<timestamp>-<session id>.jsonl`. Codex compresses old rollouts to `.jsonl.zst` and
+  removes the plain file, so reading or deleting a session's native data (steps 2 and 4 in TODO.md) must handle both.
+- Event mapping, from `--json` output (shapes observed with 0.162.1 where noted, otherwise from Codex's event
+  definitions):
+  - `item.completed` of an `agent_message` item (observed) gives `agent_message`; the final message is the text of the
+    last one.
+  - `item.started` and `item.completed` of a `command_execution` item (observed; fields `id`, `command`,
+    `aggregated_output`, `exit_code`, `status`) give `command_started` and `command_finished`.
+  - `item.completed` of a `file_change` item (observed; fields `id`, `changes` with `path` and `kind`, `status`) gives
+    `file_change`.
+  - `item.completed` of an `error` item, and top-level `error` events, give non-fatal `error` events; `turn.failed`
+    gives the fatal one.
+  - Other item types (Codex documents tool calls, web searches, and to-do lists) give `tool` on completion, named after
+    the item type. `item.started` of those, `item.updated` of anything, and `reasoning` items give nothing.
 
 `codex exec` cannot be steered mid-turn and has no live question channel, which is why SPEC.md makes follow-ups new
 turns.
+
+## Deployment
+
+devbox-mcp runs on the box as the user whose files the agents work on, under systemd; nothing else is supported. A
+`systemctl --user` service runs `tunnel-client run --profile devbox`, and tunnel-client starts devbox-mcp through the
+profile's MCP command over stdio. Lingering (`loginctl enable-linger`) keeps the service running without a login
+session.
+
+Nothing specific to one deployment is in this repository: no tunnel ID, runtime key, or hostname. They are given at
+setup on the box, by `devbox-mcp setup --tunnel-id <id>`, which reads the runtime key from stdin (never from the command
+line, where other processes can see it) and does three things:
+
+- runs `tunnel-client init --force --profile devbox --tunnel-id <id> --mcp-command "<devbox-mcp> --codex-bin <codex>"`,
+  so tunnel-client writes its own profile and devbox-mcp never writes tunnel-client's YAML. The paths are absolute,
+  because a user service's `PATH` is minimal and does not include the directories they usually live in;
+- writes the runtime key, as `CONTROL_PLANE_API_KEY=<key>`, to `~/.config/devbox-mcp/tunnel.env`, readable only by the
+  user, which the unit loads; the key appears nowhere else;
+- writes the unit, `~/.config/systemd/user/devbox-mcp.service`, from one fixed piece of text with the absolute paths
+  filled in.
+
+It then prints the remaining commands (enable lingering, reload, enable and start the service) rather than running them.
+Running it again replaces those files, for example to change the tunnel ID. Paths containing characters that would need
+escaping in a unit file or command line (whitespace, quotes, `%`, backslashes) are refused rather than escaped. For
+tests, a flag points it at another home directory and tunnel-client binary. The pinned tunnel-client release and
+devbox-mcp are installed under the user's home first; the deployment guide says how.
+
+The unit uses:
+
+- `Restart=always`. tunnel-client exits when its MCP child exits, but with status 0 even when devbox-mcp crashed (seen
+  in the spec review's probe of tunnel-client v0.0.16), so `on-failure` would leave the tunnel down. An explicit
+  `systemctl --user stop` still stops it for good.
+- `KillMode=control-group` (the default) with a stop timeout of 15 seconds: stopping the service sends SIGTERM to every
+  process in its cgroup, devbox-mcp and the agents included, which devbox-mcp handles as an orderly shutdown (`LIF-1`),
+  and SIGKILL to whatever is left after the timeout. So a service stop also stops agent processes that escaped
+  devbox-mcp's own cleanup; the gaps in TODO.md remain for devbox-mcp dying while the service keeps running, and for
+  cleaning up one turn while others continue.
+- `RuntimeDirectory=devbox-mcp` with mode `0700`, for tunnel-client's health and admin listener, which the unit's
+  command line (`tunnel-client run --profile devbox --health.unix-socket %t/devbox-mcp/tunnel-client.sock`) puts on a
+  Unix socket there instead of the default `127.0.0.1:8080`; tunnel-client's command-line flags override its profile.
+  That listener is more than health checks: in tunnel-client v0.0.16 its admin API can start Codex sessions with full
+  access, guarded only by being on loopback and a same-origin check that non-browser requests pass. On loopback TCP any
+  local user could use it, contrary to `SEC-3`; on the socket only the service's own user can.
 
 ## Testing
 
