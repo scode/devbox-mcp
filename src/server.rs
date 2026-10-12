@@ -14,7 +14,7 @@ use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData as McpError, Json, ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
 
-use crate::codex::{self, Codex, TurnRequest};
+use crate::codex::{self, Codex, Progress, TurnRequest, TurnResult};
 
 /// Server-wide settings, fixed at startup from the command line.
 #[derive(Debug, Clone)]
@@ -106,21 +106,36 @@ impl DevboxServer {
             workdir: &workdir,
             model: codex::DEFAULT_MODEL,
             effort: codex::DEFAULT_EFFORT,
+            resume: None,
         };
+        let mut native_id = None;
         // rmcp does not drop a handler's future when the client cancels the call; it only cancels this token. Dropping
         // the turn is what kills the agent, so racing the two is what makes a cancelled call stop its agent (`LIF-1`).
         let outcome = tokio::select! {
-            outcome = self.config.codex.run_turn(&req) => outcome,
+            outcome = self.config.codex.run_turn(
+                &req,
+                |progress| {
+                    if let Progress::NativeId(id) = progress {
+                        native_id = Some(id);
+                    }
+                },
+                std::future::pending(),
+            ) => outcome,
             _ = ctx.ct.cancelled() => {
                 return Err(McpError::internal_error("run_turn was cancelled by the client", None));
             }
         }
         .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+        let (completed, error) = match outcome.result {
+            TurnResult::Completed => (true, None),
+            TurnResult::Failed { error } => (false, Some(error)),
+            TurnResult::Interrupted => (false, Some("the turn was interrupted".to_owned())),
+        };
         Ok(Json(RunTurnResult {
-            completed: outcome.completed,
-            reply: outcome.agent_messages.last().cloned(),
-            error: outcome.error,
-            agent_session_id: outcome.session_id,
+            completed,
+            reply: outcome.final_message,
+            error,
+            agent_session_id: native_id,
             workdir: workdir.display().to_string(),
         }))
     }

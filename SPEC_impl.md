@@ -17,9 +17,11 @@ and are read incrementally (`TRN-*`; `run_turn` blocks instead), transcripts (`T
 `run_turn` goes away once sessions exist. Of the configuration flags below, only `--workdir-root` and `--codex-bin`
 exist so far, and `--workdir-root` is currently used directly as the default working directory.
 
-Step 1 of the roadmap in TODO.md is specified but not implemented: SPEC.md's "Self-documentation" and "MCP tools", and
-here "Storage", "Tools", "Turn lifecycle", "Self-documentation", "Turn events", the Codex event mapping, and
-"Deployment".
+Step 1 of the roadmap in TODO.md is being implemented. Done so far: the Codex module resumes sessions and maps Codex's
+output into the agent-agnostic events of "Turn events" (without the session-level `turn_started` and `turn_ended`), and
+`process::run_agent` runs any agent process with the containment of "Process model", including interrupts. Nothing of
+this is visible through the tools yet. Still to come: SPEC.md's "Self-documentation" and "MCP tools", and here
+"Storage", "Tools", "Turn lifecycle", "Self-documentation", the session-level events, and "Deployment".
 
 ## Language and dependencies
 
@@ -204,7 +206,9 @@ The turn ends only once all of this is settled: the agent exited or was killed a
 (at most two seconds after its exit), the `turn_ended` event was published, and the record was written. Until then the
 session counts as busy (`TRN-2`), so a new turn can never receive an old turn's late output.
 
-A non-JSON or unrecognized line of agent output does not end the turn; it becomes an `error` event and the turn goes on.
+A line of agent output that is not JSON does not end the turn; it becomes a non-fatal `error` event and the turn goes
+on. A JSON event of a type the agent's module does not know is ignored: agents add event types over time, most carry
+nothing a caller needs, and reporting each as an error would mislead callers into thinking something went wrong.
 
 If the first turn of a session was lost before the agent reported its native session ID, the agent's conversation may
 exist but cannot be found. That is recognizable from the record alone (no native session ID, but an earlier turn), so no
