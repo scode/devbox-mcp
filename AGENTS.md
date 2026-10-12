@@ -11,13 +11,17 @@ agreement before changing it. Keep SPEC_impl.md, including its implementation st
 change.
 
 The security model in SPEC.md (the `SEC-*` requirements, and the rules in SPEC_impl.md that enforce them) is a hard
-requirement. Never weaken it, work around it, or reinterpret it, for instance by opening a port or socket, adding a
-listener-capable dependency feature, or adding another way into the box, without extremely explicit confirmation from
-the user for that specific change. This applies to tests, debugging aids, and temporary changes too.
+requirement. Never weaken it, work around it, or reinterpret it, for instance by making devbox-mcp open a port or
+socket, adding a listener-capable dependency feature, or adding another way into the box, without extremely explicit
+confirmation from the user for that specific change. For devbox-mcp itself this applies in tests, debugging aids, and
+temporary changes too. Local development and test tooling (not devbox-mcp) may listen, but only locally: on loopback or
+on Unix sockets in private temporary directories (SPEC_impl.md, "Testing").
 
 ## Before finishing work
 
-Run the same checks CI runs, with the same arguments, and make sure they all pass:
+`cargo test` needs the pinned tunnel-client; install it once with `scripts/install-tunnel-client.sh` (see
+[docs/testing.md](docs/testing.md)). Then run the same checks CI runs, with the same arguments, and make sure they all
+pass:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy`

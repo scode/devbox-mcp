@@ -49,6 +49,8 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
+      # The tunnel tests (tests/tunnel.rs) run devbox-mcp behind the real tunnel-client.
+      - run: scripts/install-tunnel-client.sh
       - run: cargo test
 
   dprint:
