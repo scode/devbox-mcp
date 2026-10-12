@@ -106,6 +106,10 @@ pub struct SessionSummary {
     pub name: String,
     /// The agent the session runs.
     pub agent: Agent,
+    /// The model the agent runs, chosen when the session was created and fixed for its life.
+    pub model: String,
+    /// The reasoning effort the agent runs at, chosen when the session was created and fixed for its life.
+    pub effort: String,
     /// Absolute path of the directory the agent works in.
     pub workdir: String,
     /// The session's most recent turn, or null if nothing has been sent to it yet.
@@ -171,6 +175,8 @@ impl Session {
         SessionSummary {
             name: self.record.name.clone(),
             agent: self.record.agent,
+            model: self.record.model.clone(),
+            effort: self.record.effort.clone(),
             workdir: self.record.workdir.display().to_string(),
             turn: self.record.turn.as_ref().map(TurnSummary::from_record),
         }
@@ -228,8 +234,16 @@ impl Sessions {
         name: &str,
         workdir: Option<&str>,
         agent: Option<Agent>,
+        model: Option<&str>,
+        effort: Option<&str>,
     ) -> Result<SessionSummary, SessionError> {
         validate_name(name)?;
+        if let Some(model) = model {
+            validate_model(model)?;
+        }
+        if let Some(effort) = effort {
+            validate_effort(effort)?;
+        }
         let mut table = self.table.lock().unwrap();
         if let Some(existing) = table.sessions.get(name) {
             let summary = serde_json::to_string(&existing.summary()).unwrap_or_default();
@@ -270,8 +284,8 @@ impl Sessions {
             name: name.to_owned(),
             agent: agent.unwrap_or(Agent::Codex),
             workdir,
-            model: codex::DEFAULT_MODEL.to_owned(),
-            effort: codex::DEFAULT_EFFORT.to_owned(),
+            model: model.unwrap_or(codex::DEFAULT_MODEL).to_owned(),
+            effort: effort.unwrap_or(codex::DEFAULT_EFFORT).to_owned(),
             native_id: None,
             turn: None,
             requests: Vec::new(),
@@ -473,6 +487,52 @@ fn sha256_hex(text: &str) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+/// Checks a caller-chosen model name (SPEC_impl.md, "Tools"): 1 to 128 characters from `A-Z a-z 0-9 . _ : / -`.
+///
+/// This is only about what can be handed to the agent safely, not about what the agent supports: devbox-mcp keeps no
+/// model list (SPEC.md `SES-7`), so a model the agent does not know makes the session's turns fail with the agent's own
+/// error instead.
+fn validate_model(model: &str) -> Result<(), SessionError> {
+    let ok = !model.is_empty()
+        && model.len() <= 128
+        && model
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '/' | '-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(SessionError::Invalid(format!(
+            "invalid model {}: use 1 to 128 characters from A-Z, a-z, 0-9, '.', '_', ':', '/', and '-', or omit it to \
+             use the default ({})",
+            shown(model),
+            codex::DEFAULT_MODEL
+        )))
+    }
+}
+
+/// Checks a caller-chosen reasoning effort (SPEC_impl.md, "Tools"): 1 to 32 characters from `a-z 0-9 _ -`.
+///
+/// The effort goes into a TOML override on Codex's command line (`-c model_reasoning_effort="<effort>"`), so the
+/// characters are restricted to ones that cannot break out of that string. Which efforts a model supports is the
+/// agent's business, as for the model.
+fn validate_effort(effort: &str) -> Result<(), SessionError> {
+    let ok = !effort.is_empty()
+        && effort.len() <= 32
+        && effort
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(SessionError::Invalid(format!(
+            "invalid effort {}: use 1 to 32 characters from a-z, 0-9, '_', and '-' (for example low, medium, high, \
+             xhigh), or omit it to use the default ({})",
+            shown(effort),
+            codex::DEFAULT_EFFORT
+        )))
+    }
 }
 
 /// Checks a caller-chosen request ID: 1 to 128 characters from `A-Z a-z 0-9 . _ : -`, so it is safe to echo in

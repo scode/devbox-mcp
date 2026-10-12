@@ -6,14 +6,14 @@ agreement.
 
 ## Implementation status
 
-The code is an early prototype, part way through step 1 of the roadmap in TODO.md. Implemented: the stdio transport and
+The code is an early prototype, part way through step 2 of the roadmap in TODO.md. Implemented: the stdio transport and
 the security posture (`SEC-*`, `TSP-1`), `LIF-1` for orderly shutdowns, sessions (`SES-*` except removal) with the Codex
-adapter, the session store of "Storage", and turns (`TRN-*`) with "Turn lifecycle", "Turn events", cursors, request IDs,
-liveness, and the bounds of `BND-*`, through the five session tools.
+adapter and a model and effort chosen at creation, the session store of "Storage", and turns (`TRN-*`) with "Turn
+lifecycle", "Turn events", cursors, request IDs, liveness, and the bounds of `BND-*`, through the five session tools.
 
-Not yet implemented: transcripts (`TRA-*`), session removal (`SES-1`, `SES-6`), and choosing a session's model and
-effort (`SES-7`); the last two are specified below for step 2 of the roadmap in TODO.md. "Deployment" is implemented by
-`devbox-mcp setup`; [docs/deployment.md](docs/deployment.md) is the guide.
+Not yet implemented: transcripts (`TRA-*`) and session removal (`SES-1`, `SES-6`), which is specified below for step 2
+of the roadmap in TODO.md. "Deployment" is implemented by `devbox-mcp setup`; [docs/deployment.md](docs/deployment.md)
+is the guide.
 
 ## Language and dependencies
 
