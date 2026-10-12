@@ -341,8 +341,9 @@ Events are agent-agnostic. Each has a `seq`, a `turn_id`, a `time`, a `type`, an
 - `turn_started { message }`, with the message cut like any text field;
 - `agent_message { text }`;
 - `command_started { item_id, command }` and `command_finished { item_id, command, status, exit_code, output }`, where
-  `status` is `completed`, `failed`, or `declined`, `exit_code` is null when the command did not run to an exit or the
-  agent does not report one (Claude does not), and `output` is the end of its combined output; `item_id` pairs the two;
+  `status` is `completed`, `failed`, or `declined`, `exit_code` is null only when the command did not run to an exit
+  (declined or blocked, interrupted, or for Claude sent to the background) and never just because it succeeded, and
+  `output` is the end of its combined output; `item_id` pairs the two;
 - `file_change { item_id, status, changes: [{ path, kind }] }`, where `status` says whether the change was applied
   (`completed`) or not (`failed`);
 - `tool { item_id, name, status }` for other agent tool use the adapter recognizes but has no specific event for, and
@@ -450,7 +451,15 @@ The Claude adapter uses Claude Code's print mode, checked against Claude Code 2.
   - `text` blocks of `assistant` messages give `agent_message`; the final message is the `result` event's `result`.
   - A `tool_use` block named `Bash` gives `command_started` (`item_id` is the block's `id`, `command` its
     `input.command`), and the matching `tool_result` (in a `user` message, same `tool_use_id`) gives `command_finished`:
-    `failed` when `is_error` is true, otherwise `completed`, with a null `exit_code` and the result's text as output.
+    `failed` when `is_error` is true, otherwise `completed`, with the result's text as output. Claude reports no exit
+    code as a field, so `exit_code` comes from what its results mean: a failed command that ran to an exit has a result
+    text starting `Exit code N`, which gives N (the other failures are commands that never ran, null); a successful
+    command exited 0, unless it was sent to the background (`input.run_in_background`, or a `backgroundTaskId` in the
+    event's `tool_use_result`) or interrupted (`tool_use_result.interrupted`), which give null. Only the structured
+    `tool_use_result` can rule those out, and an event has one for all its results, so 0 is claimed only for an event
+    carrying that one result with its `tool_use_result`; otherwise the exit code is unknown and null. Checked against
+    413 failed Bash calls in a sample of real Claude Code transcripts (versions up to 2.1.296), 281 of them with the
+    prefix.
   - `tool_use` of `Write` (kind `add`) or `Edit` and `MultiEdit` (kind `update`) gives `file_change` for
     `input.file_path` when its `tool_result` arrives, `failed` if that is an error.
   - Any other `tool_use` gives `tool`, named after the tool, when its `tool_result` arrives.
