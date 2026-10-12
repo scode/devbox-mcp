@@ -316,12 +316,23 @@ impl ClaudeTurn {
                 }
             }
             "user" => {
+                // The event's `tool_use_result` holds the structured result (for Bash: whether it was interrupted or
+                // sent to the background), but there is one per event, so it is used only when the event carries a
+                // single tool result it can belong to.
+                let results = blocks(&event)
+                    .filter(|b| b["type"] == "tool_result")
+                    .count();
+                let structured = if results == 1 {
+                    &event["tool_use_result"]
+                } else {
+                    &Value::Null
+                };
                 for block in blocks(&event) {
                     if block["type"] == "tool_result"
                         && let Some(id) = block["tool_use_id"].as_str()
                         && let Some(tool) = self.pending.remove(id)
                     {
-                        on_progress(Progress::Event(tool_finished(id, &tool, block)));
+                        on_progress(Progress::Event(tool_finished(id, &tool, block, structured)));
                     }
                 }
             }
@@ -390,8 +401,9 @@ fn blocks(event: &Value) -> impl Iterator<Item = &Value> {
 
 /// The event for a tool call whose result has arrived: `command_finished` for `Bash`, `file_change` for the editing
 /// tools, `tool` for the rest (SPEC_impl.md, "Claude").
-fn tool_finished(id: &str, tool: &PendingTool, result: &Value) -> AgentEvent {
+fn tool_finished(id: &str, tool: &PendingTool, result: &Value, structured: &Value) -> AgentEvent {
     let failed = result["is_error"].as_bool().unwrap_or(false);
+    let text = result_text(&result["content"]);
     let status = if failed { "failed" } else { "completed" };
     let mut b = Bounder::default();
     let kind = match tool.name.as_str() {
@@ -402,9 +414,8 @@ fn tool_finished(id: &str, tool: &PendingTool, result: &Value) -> AgentEvent {
                 Keep::Head,
             ),
             status: status.to_owned(),
-            // Claude reports no exit code, only whether the command failed.
-            exit_code: None,
-            output: b.text(&result_text(&result["content"]), Keep::Tail),
+            exit_code: bash_exit_code(failed, &text, &tool.input, structured),
+            output: b.text(&text, Keep::Tail),
         },
         "Write" | "Edit" | "MultiEdit" => {
             let kind = if tool.name == "Write" {
@@ -432,6 +443,32 @@ fn tool_finished(id: &str, tool: &PendingTool, result: &Value) -> AgentEvent {
         },
     };
     b.finish(kind)
+}
+
+/// The exit code of a finished `Bash` call, which Claude does not report as a field (SPEC_impl.md, "Claude").
+///
+/// Claude marks a command that exited nonzero as an error whose text starts `Exit code N` (281 of 413 failed Bash
+/// calls in a sample of real Claude Code transcripts, across versions up to 2.1.296); the other failures are commands
+/// that never ran (blocked, or needing approval), which have no exit code. A call that is not an error is a command
+/// that exited 0, unless it was sent to the background (it returns at once, before the command ends) or interrupted.
+///
+/// Only the structured result (`tool_use_result`) can rule those two out, so 0 is claimed only when it is present; without
+/// it (an event carrying several results, or a Claude version that leaves it out) the exit code is unknown and null.
+fn bash_exit_code(failed: bool, text: &str, input: &Value, structured: &Value) -> Option<i64> {
+    if failed {
+        let rest = text.strip_prefix("Exit code ")?;
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        return digits.parse().ok();
+    }
+    if !structured.is_object() {
+        return None;
+    }
+    let backgrounded =
+        input["run_in_background"] == true || !structured["backgroundTaskId"].is_null();
+    if backgrounded || structured["interrupted"] == true {
+        return None;
+    }
+    Some(0)
 }
 
 /// The text of a tool result's content, which Claude sends either as a string or as a list of text blocks.
@@ -517,7 +554,9 @@ mod tests {
                     {"type":"tool_use","id":"t2","name":"Write","input":{"file_path":"/w/a.txt","content":"x"}},
                     {"type":"tool_use","id":"t3","name":"Read","input":{"file_path":"/w/b.txt"}}]}}),
                 serde_json::json!({"type":"user","message":{"content":[
-                    {"type":"tool_result","tool_use_id":"t1","is_error":false,"content":"a.txt"},
+                    {"type":"tool_result","tool_use_id":"t1","is_error":false,"content":"a.txt"}]},
+                    "tool_use_result":{"stdout":"a.txt","stderr":"","interrupted":false,"isImage":false}}),
+                serde_json::json!({"type":"user","message":{"content":[
                     {"type":"tool_result","tool_use_id":"t2","content":[{"type":"text","text":"ok"}]},
                     {"type":"tool_result","tool_use_id":"t3","is_error":true,"content":"no such file"}]}}),
                 serde_json::json!({"type":"result","subtype":"success","is_error":false,"result":"done"}),
@@ -537,7 +576,7 @@ mod tests {
                     item_id: "t1".into(),
                     command: "ls".into(),
                     status: "completed".into(),
-                    exit_code: None,
+                    exit_code: Some(0),
                     output: "a.txt".into(),
                 },
                 EventKind::FileChange {
@@ -618,6 +657,65 @@ mod tests {
         assert_eq!(progress, [Progress::ForeignConversation]);
         let outcome = turn.finish(exited_ok());
         assert!(matches!(outcome.result, TurnResult::Failed { .. }));
+    }
+
+    /// Claude reports no exit code as a field, so it is recovered where Claude's own behavior determines it: the
+    /// `Exit code N` prefix of a failed command, and 0 for a foreground command that succeeded. A command that never ran,
+    /// was sent to the background, or was interrupted has no exit code, and claiming one would mislead the caller; so does
+    /// a success without the structured result, which alone could rule out the last two.
+    #[test]
+    fn recovers_bash_exit_codes() {
+        let run = |input: Value, result: Value, structured: Value| {
+            let tool = PendingTool {
+                name: "Bash".into(),
+                input,
+            };
+            match tool_finished("t", &tool, &result, &structured).kind {
+                EventKind::CommandFinished { exit_code, .. } => exit_code,
+                other => panic!("unexpected {other:?}"),
+            }
+        };
+        let cmd = serde_json::json!({ "command": "x" });
+        let ok = serde_json::json!({ "is_error": false, "content": "done" });
+        let ran = serde_json::json!({ "stdout": "done", "interrupted": false });
+        assert_eq!(run(cmd.clone(), ok.clone(), ran.clone()), Some(0));
+        assert_eq!(run(cmd.clone(), ok.clone(), Value::Null), None);
+        assert_eq!(
+            run(
+                cmd.clone(),
+                serde_json::json!({ "is_error": true, "content": "Exit code 2\nno such file" }),
+                Value::Null
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            run(
+                cmd.clone(),
+                serde_json::json!({ "is_error": true, "content": "This command requires approval" }),
+                Value::Null
+            ),
+            None
+        );
+        assert_eq!(
+            run(
+                serde_json::json!({ "command": "x", "run_in_background": true }),
+                ok.clone(),
+                ran
+            ),
+            None
+        );
+        assert_eq!(
+            run(
+                cmd.clone(),
+                ok.clone(),
+                serde_json::json!({ "backgroundTaskId": "b1" })
+            ),
+            None
+        );
+        assert_eq!(
+            run(cmd, ok, serde_json::json!({ "interrupted": true })),
+            None
+        );
     }
 
     /// First turns start the chosen conversation and later ones resume it; the message is never on the command line.

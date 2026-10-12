@@ -57,7 +57,9 @@ pub enum EventKind {
         command: String,
         /// How the command ended as the agent reports it, for example `completed`, `failed`, or `declined`.
         status: String,
-        /// The command's exit code, or null when it did not run to an exit (for example when it was declined).
+        /// The command's exit code. Null means the command did not run to an exit, not that it succeeded: it was
+        /// declined or blocked, was interrupted, or (for claude) was sent to run in the background, so the turn went on
+        /// before it finished.
         exit_code: Option<i64>,
         /// The end of the command's combined standard output and error.
         output: String,
