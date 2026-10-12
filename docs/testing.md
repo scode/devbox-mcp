@@ -123,10 +123,9 @@ and were not):
 - Create a profile. The executable must exist and the path must be absolute, because `init` checks it: `tunnel-client
   init --profile devbox --tunnel-id <tunnel id> --mcp-command "/abs/path/devbox-mcp --workdir-root /abs/scratch/dir"`.
   This writes `~/.config/tunnel-client/devbox.yaml`.
-- Decide about the health and admin listener. The generated profile has tunnel-client listen on `127.0.0.1:8080` for
-  health checks and a local admin web UI. That is tunnel-client's listener, not devbox-mcp's, but it is a local way into
-  tunnel-client; to avoid TCP entirely, replace `listen_addr` under `health:` with `unix_socket:` and a path in a
-  directory only the service user can read.
+- Leave the health and admin listener as generated. The profile has tunnel-client listen on `127.0.0.1:8080` for health
+  checks and a local admin web UI (not for MCP traffic, which reaches devbox-mcp over stdio). The current choice is to
+  keep that default for simplicity and browser access; TODO.md tracks moving it to a Unix socket later.
 - `tunnel-client doctor --profile devbox --explain`, then `tunnel-client run --profile devbox`.
 - While it runs, add a custom MCP server with a Tunnel connection in
   [ChatGPT's connector settings](https://chatgpt.com/#settings/Connectors), select the tunnel, and ask the Dot to use
