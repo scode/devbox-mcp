@@ -1,0 +1,19 @@
+{
+  "json": {
+  },
+  "markdown": {
+    "lineWidth": 120,
+    "newLineKind": "lf",
+    "textWrap": "always"
+  },
+  "toml": {
+  },
+  "excludes": [
+    "**/*-lock.json"
+  ],
+  "plugins": [
+    "npm:@dprint/json@0.25.2@cefeda3078b93101a3ae1d46f70a69efaa3c2caa7a3107c6f7dad321fbd033e5",
+    "npm:@dprint/markdown@0.26.0@f22d576befb4511ba5d19ddd41414cb00a007db37e70cf0b27ece82b511f6caf",
+    "npm:@dprint/toml@0.9.0@2cac97483311ab7e36373e02592b9757f9619f6aa2f7e232bb0a6bd143a75caa"
+  ]
+}
