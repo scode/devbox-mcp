@@ -17,7 +17,7 @@ tunnel for any turn longer than the tunnel's response deadline.
 - [x] Spec. The MCP tool surface for creating, listing, and messaging sessions, reading turn events, and interrupting a
       turn: tool names and schemas, the event model, turn states, cursors, retries, bounds, liveness, and durability.
       Drafted in SPEC.md and SPEC_impl.md, revised after an adversarial review and a complexity review, and agreed.
-- [ ] Plan and implement. Including a tunnel test that a running turn does not hold up other calls, the manual test
+- [x] Plan and implement. Including a tunnel test that a running turn does not hold up other calls, the manual test
       layers, a passing "cold agent" check of the tool descriptions (`DOC-*`), the `devbox-mcp setup` command, and a
       deployment guide good enough for the user to try it with a real Dot.
 

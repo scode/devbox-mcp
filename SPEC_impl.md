@@ -11,7 +11,8 @@ the security posture (`SEC-*`, `TSP-1`), `LIF-1` for orderly shutdowns, sessions
 adapter, the session store of "Storage", and turns (`TRN-*`) with "Turn lifecycle", "Turn events", cursors, request IDs,
 liveness, and the bounds of `BND-*`, through the five session tools.
 
-Not yet implemented: transcripts (`TRA-*`), session removal (`SES-1`, `SES-6`), and "Deployment".
+Not yet implemented: transcripts (`TRA-*`) and session removal (`SES-1`, `SES-6`). "Deployment" is implemented by
+`devbox-mcp setup`; [docs/deployment.md](docs/deployment.md) is the guide.
 
 ## Language and dependencies
 
@@ -327,19 +328,25 @@ Nothing specific to one deployment is in this repository: no tunnel ID, runtime 
 setup on the box, by `devbox-mcp setup --tunnel-id <id>`, which reads the runtime key from stdin (never from the command
 line, where other processes can see it) and does three things:
 
-- runs `tunnel-client init --force --profile devbox --tunnel-id <id> --mcp-command "<devbox-mcp> --codex-bin <codex>"`,
-  so tunnel-client writes its own profile and devbox-mcp never writes tunnel-client's YAML. The paths are absolute,
-  because a user service's `PATH` is minimal and does not include the directories they usually live in;
+- runs `tunnel-client init --force --profile devbox --profile-dir ~/.config/tunnel-client --tunnel-id <id> --mcp-command
+  "<devbox-mcp> --codex-bin <codex>"`, so tunnel-client writes its own profile and devbox-mcp never writes
+  tunnel-client's YAML. `<devbox-mcp>` is the binary running setup. The paths are absolute, because a user service's
+  `PATH` is minimal and does not include the directories they usually live in. The profile directory is explicit, here
+  and in the unit, so an `XDG_CONFIG_HOME` in the shell running setup cannot put the profile where the service does not
+  look;
 - writes the runtime key, as `CONTROL_PLANE_API_KEY=<key>`, to `~/.config/devbox-mcp/tunnel.env`, readable only by the
   user, which the unit loads; the key appears nowhere else;
 - writes the unit, `~/.config/systemd/user/devbox-mcp.service`, from one fixed piece of text with the absolute paths
   filled in.
 
 It then prints the remaining commands (enable lingering, reload, enable and start the service) rather than running them.
-Running it again replaces those files, for example to change the tunnel ID. Paths containing characters that would need
-escaping in a unit file or command line (whitespace, quotes, `%`, backslashes) are refused rather than escaped. For
-tests, a flag points it at another home directory and tunnel-client binary. The pinned tunnel-client release and
-devbox-mcp are installed under the user's home first; the deployment guide says how.
+It does not pass on `tunnel-client init`'s own output unless init fails: that output advises running tunnel-client in
+the foreground, which would serve its admin API on the profile's loopback TCP port instead of the unit's socket. The key
+file is created afresh each time, never written through whatever was at its path, so a symlink or hardlink there cannot
+carry the key into another file. Running it again replaces those files, for example to change the tunnel ID. Paths
+containing characters that would need escaping in a unit file or command line (whitespace, quotes, `%`, backslashes) are
+refused rather than escaped. For tests, a flag points it at another home directory and tunnel-client binary. The pinned
+tunnel-client release and devbox-mcp are installed under the user's home first; the deployment guide says how.
 
 The unit uses:
 
@@ -352,11 +359,12 @@ The unit uses:
   devbox-mcp's own cleanup; the gaps in TODO.md remain for devbox-mcp dying while the service keeps running, and for
   cleaning up one turn while others continue.
 - `RuntimeDirectory=devbox-mcp` with mode `0700`, for tunnel-client's health and admin listener, which the unit's
-  command line (`tunnel-client run --profile devbox --health.unix-socket %t/devbox-mcp/tunnel-client.sock`) puts on a
-  Unix socket there instead of the default `127.0.0.1:8080`; tunnel-client's command-line flags override its profile.
-  That listener is more than health checks: in tunnel-client v0.0.16 its admin API can start Codex sessions with full
-  access, guarded only by being on loopback and a same-origin check that non-browser requests pass. On loopback TCP any
-  local user could use it, contrary to `SEC-3`; on the socket only the service's own user can.
+  command line (`tunnel-client run --profile devbox --profile-dir ~/.config/tunnel-client --health.unix-socket
+  %t/devbox-mcp/tunnel-client.sock`) puts on a Unix socket there instead of the default `127.0.0.1:8080`;
+  tunnel-client's command-line flags override its profile (observed with v0.0.16: with the flag, the socket is its only
+  listener). That listener is more than health checks: in tunnel-client v0.0.16 its admin API can start Codex sessions
+  with full access, guarded only by being on loopback and a same-origin check that non-browser requests pass. On
+  loopback TCP any local user could use it, contrary to `SEC-3`; on the socket only the service's own user can.
 
 ## Testing
 
