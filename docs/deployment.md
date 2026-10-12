@@ -100,7 +100,16 @@ A Dot can then use devbox-mcp's tools. The tools describe themselves, so asking 
 enough to get started, for example: "Using devbox, create a session called `smoke` and have the agent run `uname -a` and
 `ls -la` in its working directory. Tell me exactly what it reported."
 
-## What the agents' commands can find
+## How the agents run
+
+Agents run as you: as the Unix user the service belongs to, with no sandbox, no approval prompts, and unrestricted
+network access, so an agent can do anything you can do on the box with your files and credentials. Each works in its
+session's working directory. Commands get no terminal and empty input, so most programs that would ask for input (a
+password prompt, an ssh login, a confirmation) fail at once, and a calling model sees that failure in the turn's events.
+A program can handle missing input differently, for example by asking again forever, and nothing times commands out, so
+such a turn keeps running until it is interrupted; the calling model is told to keep agents non-interactive and to
+interrupt a turn that stops producing events. The server's instructions say all this to the calling model, naming the
+user, so it knows what it is handing work to.
 
 Commands an agent runs see the service's environment, not your login shell's, with one exception: setup writes the
 `PATH` of the shell you ran it in into the unit, so agents find the same tools you do. Without that, the service would
@@ -118,6 +127,11 @@ work under `~/devbox-mcp/work`.
 
 Install the new devbox-mcp (and, if the repository pins a newer one, tunnel-client) the same way as above, then restart
 the service. Restarting stops any turn in progress; its session reports the turn as lost afterwards.
+
+ChatGPT keeps the tool list it fetched when the connector was created and does not fetch it again on its own. After an
+upgrade that adds or changes tools, open the app in ChatGPT's settings and press Refresh, then start a new chat; chats
+that already existed may keep the old tools. On a workspace where an admin approved the app, the admin has to review and
+publish the update before anyone sees it.
 
 ## Removing it
 

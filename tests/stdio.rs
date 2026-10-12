@@ -78,6 +78,34 @@ async fn every_tool_and_field_is_described() {
     client.cancel().await.unwrap();
 }
 
+/// Spec (`DOC-1`): the server instructions tell a caller how agents run before it hands one real work: as which Unix
+/// user, without sandbox or approval prompts, with network access, and without a terminal or input, with the advice to
+/// keep agents non-interactive since not every program gives up on a missing answer. A caller converting an existing
+/// workflow asked for exactly this. The test's devbox-mcp has no `$USER`, so the user is given by ID.
+#[tokio::test]
+async fn instructions_describe_how_agents_run() {
+    let h = Harness::new();
+    let client = connect(&h).await;
+    let instructions = client
+        .peer_info()
+        .and_then(|info| info.instructions.clone())
+        .unwrap_or_default();
+    for expected in [
+        "Unix user with user ID",
+        "no sandbox",
+        "no approval prompts",
+        "network access",
+        "no terminal and empty input",
+        "non-interactively",
+    ] {
+        assert!(
+            instructions.contains(expected),
+            "missing {expected:?} in:\n{instructions}"
+        );
+    }
+    client.cancel().await.unwrap();
+}
+
 /// Collects, under `path`, every entry of every `properties` map anywhere in `schema` that has no non-empty
 /// `description`.
 ///
