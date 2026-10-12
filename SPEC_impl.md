@@ -11,7 +11,8 @@ and the security posture (`SEC-*`, `TSP-1`), `LIF-1` for orderly shutdowns, sess
 model and effort chosen at creation, and removal, the session store of "Storage", and turns (`TRN-*`) with "Turn
 lifecycle", "Turn events", cursors, request IDs, liveness, and the bounds of `BND-*`, through the six session tools.
 
-Not yet implemented: transcripts (`TRA-*`). "Deployment" is implemented by `devbox-mcp setup`;
+Specified below for steps 3 and 4 of the roadmap but not yet implemented: Claude as a second agent and the
+`session_transcript` tool (`TRA-2`). "Deployment" is implemented by `devbox-mcp setup`;
 [docs/deployment.md](docs/deployment.md) is the guide.
 
 ## Language and dependencies
@@ -77,8 +78,8 @@ Known gaps, both of which need a cgroup per agent to close (tracked in [TODO.md]
 
 ## Configuration
 
-All configuration is through command-line flags, so tests can inject every path and executable without touching
-environment variables:
+All of devbox-mcp's own configuration is through command-line flags, so tests can inject every path and executable
+without touching environment variables:
 
 - `--state-dir`: where session records live. Defaults to `$XDG_STATE_HOME/devbox-mcp`, falling back to
   `~/.local/state/devbox-mcp`.
@@ -86,12 +87,22 @@ environment variables:
   session named `foo` with no explicit working directory works in `~/devbox-mcp/work/foo`. The directory is created when
   the session is created.
 - `--codex-bin`: the Codex executable. Defaults to `codex` on `PATH`.
+- `--claude-bin`: the Claude Code executable. Defaults to `claude` on `PATH`.
+
+The agents' own data directories are not flags. devbox-mcp finds each one the way the agent itself does, from the
+agent's environment variable or else the home directory (`$CODEX_HOME`, else `~/.codex`; `$CLAUDE_CONFIG_DIR`, else
+`~/.claude`), and uses it only for its own reads (transcripts) and Claude's deletions; it sets nothing on the agents it
+starts. Exporting a resolved default would not be harmless: Claude Code reads its global `.claude.json` from
+`$CLAUDE_CONFIG_DIR` when that is set and from the home directory otherwise, so setting it even to `~/.claude` would
+hide the user's global Claude settings from every agent (contrary to `SEC-4`). Tests stay away from the real directories
+because they start devbox-mcp with a temporary `HOME`.
 
 ## Storage
 
 Each session is one JSON file, `<state-dir>/sessions/<name>.json`. It holds:
 
-- the name, agent, working directory, model and effort, and the agent's native session ID once known (`SES-5`);
+- the name, agent, working directory, model and effort, and the agent's native session ID once known (`SES-5`). For
+  Claude, devbox-mcp chooses that ID itself and saves it with the session's first send (see "Claude");
 - the most recent turn (`SES-8`): its ID (turn IDs count up from 1 within a session), its state, when it started and
   ended, the agent's final message (at most 32 KiB, cut with a `final_message_truncated` flag), and, for a failed turn,
   the error that ended it (at most 4 KiB, ending in ` [cut]` when it was longer);
@@ -109,15 +120,18 @@ the send fails and nothing runs. If a later write fails, the call or turn that m
 the correct state, and the next successful write of that session brings the file up to date.
 
 Removing a session deletes its record file after the agent's own data is gone, so a crash in between leaves a record
-whose agent data no longer exists. Removing it again then fails, since the agent's delete command cannot tell "already
-gone" from a failure, and the caller forces the removal; a send to it in the meantime fails the way a resume of a
-missing conversation fails.
+whose agent data no longer exists. For Codex, removing it again then fails, since its delete command cannot tell
+"already gone" from a failure, and the caller forces the removal; a send to it in the meantime fails the way a resume of
+a missing conversation fails. For Claude, removing it again finds nothing left and succeeds, and a send in the meantime
+starts a fresh conversation under the same ID, reporting `context_reset` (see "Claude").
 
-A record also says whether an earlier conversation of the session was never tracked. That is set when a send starts a
-fresh conversation because the previous one could not be resumed (`context_reset`, `SES-5`): the agent may have stored
-that earlier conversation, but devbox-mcp never learned its ID, so it cannot delete it, and removal requires `force`.
-Records written before this was tracked lack it; for them nobody knows, so a session past its first turn is treated as
-possibly having such a conversation (a reset needs an earlier turn), and one still at its first turn as not having one.
+A record also says whether an earlier conversation of the session was never tracked: whether the agent may hold data
+under an ID devbox-mcp cannot account for, which it therefore cannot delete, so removal requires `force`. For Codex that
+is set when a send starts a fresh conversation because the previous one could not be resumed (`context_reset`, `SES-5`).
+For Claude it is set only when Claude reports a different conversation ID than the one devbox-mcp chose (see "Claude");
+a Claude restart under its own known ID leaves nothing untracked. Records written before this was tracked lack it; for
+them nobody knows, so a session past its first turn is treated as possibly having such a conversation (a reset needs an
+earlier turn), and one still at its first turn as not having one.
 
 Records are read at startup. A most recent turn still recorded as `running` or `interrupting` is reported as `lost`
 (`TRN-5`); the file itself is updated with the session's next write. A record that cannot be parsed is left untouched, a
@@ -141,11 +155,15 @@ as MCP structured content and, for clients that ignore that, as the same JSON as
 
 - `session_create { name, workdir?, agent?, model?, effort? }`: `workdir` defaults to `<workdir-root>/<name>` and must
   be absolute. It is created with its parents if missing; if it exists it must be a directory (symlinks are followed).
-  The session exists once its record is on disk; a directory created before a failure is left in place. `agent` must be
-  `codex`. `model` is 1 to 128 characters from `A-Z a-z 0-9 . _ : / -`, and `effort` 1 to 32 characters from `a-z 0-9
-  _ -`; that check is only about what can be passed to the agent safely (the effort goes into a TOML override), not
-  about what the agent supports. Returns a session summary. On a name collision, the error message includes the existing
-  session's summary.
+  The session exists once its record is on disk; a directory created before a failure is left in place. `agent` is
+  `codex` (the default) or `claude`. `model` is 1 to 128 characters from `A-Z a-z 0-9 . _ : / -`, and `effort` 1 to 32
+  characters from `a-z 0-9 _ -`; that check is only about what can be passed to the agent safely (the effort goes into a
+  TOML override for Codex), not about what the agent supports. For `claude`, `effort` must also be one Claude's CLI
+  accepts (`low`, `medium`, `high`, `xhigh`, `max`), because Claude ignores any other with only a warning (`SES-7`).
+  Nothing else is checked against what an agent supports, so the tool's description says that whether an unsupported
+  choice is rejected at creation depends on the agent and the value, and that a successful creation does not mean the
+  agent supports it. Returns a session summary. On a name collision, the error message includes the existing session's
+  summary.
 - `session_list { after? }`: returns `{ sessions: [summary], next_after? }`: at most 50 sessions in name order, starting
   after the name `after`; `next_after` is present when more follow. A summary is `{ name, agent, model, effort, workdir,
   turn }`, where `turn` is the most recent turn as `{ id, state, started_at, ended_at?, final_message_preview?,
@@ -168,6 +186,29 @@ as MCP structured content and, for clients that ignore that, as the same JSON as
   `turn_duration_seconds` is the time since it started, for an ended one the time it ran. Times are RFC 3339 timestamps
   in UTC; durations are whole seconds.
 - `session_interrupt { name }`: returns the most recent turn as in a summary, normally with state `interrupting`.
+- `session_transcript { name, from?, limit? }`: returns `{ entries: [{ index, entry, truncated? }], total, next_from? }`
+  from the agent's native transcript of the session's current conversation (`TRA-2`), one entry per line of the agent's
+  own JSONL record, numbered from 0 in file order, always in ascending order. `limit` is 1 to 50 (default 20).
+  - Without `from`, the read fills from the newest entry backwards, so the end of the transcript is always included and
+    reading it needs no knowledge of the length; to page back, pass `from` as the first returned index minus `limit`.
+    With `from`, it fills forwards from that entry. `next_from` is the index after the last entry returned, present when
+    more entries follow.
+  - `entry` is the line's JSON value, unchanged except that every string longer than 4 KiB is cut to 4 KiB and ends in
+    ` [cut]`. If the entry is still larger than 64 KiB once serialized (a huge array, say), it is replaced by its
+    serialized JSON cut to 64 KiB as a string, with `truncated: true`. A line that is not valid JSON is returned as a
+    string, cut the same way. So one entry never exceeds 64 KiB, and a read always returns at least one entry and moves
+    forward.
+  - A read stops adding entries once they total 256 KiB, the newest end first when reading from the end (`BND-1`).
+  - The read works on the file as it was when the read started: its length is taken first, and a partial last line (the
+    agent is still writing it) is left out.
+  - Fails with an error that says why when the session has no conversation yet, when the agent's transcript file cannot
+    be found where the adapter looks (it may have been deleted, compressed, or moved by the agent; asking the agent
+    itself still works, `TRA-1`), when looking for it fails or finds more than one, when it cannot be read, or when it
+    is larger than 1 GiB. It never returns an empty list for a transcript it could not find.
+  - Only the current conversation is reachable; one left behind by a context reset has no known ID.
+  - The read scans the file to number its lines, on a blocking thread, so its cost grows with the file: about a second
+    for 100 MB. Like `session_remove`'s wait, that holds up other calls through the tunnel while it runs; transcripts of
+    that size are rare, and per-call scan budgets were judged not worth their extra failure modes.
 - `session_remove { name, force? }`: returns `{ session, agent_data_deleted }`, where `session` is the summary as it was
   just before removal. Fails if the session does not exist or its most recent turn is `running` or `interrupting`.
   Without `force`, it also fails when deleting the agent's data fails, and when deletion cannot be confirmed: the
@@ -207,11 +248,12 @@ agent output are read whole; the agent is trusted under the security model, so a
 nothing more.
 
 No call waits on an agent or on a background task (`BND-2`): each one reads or updates in-memory state and, at most,
-writes one session record. The one exception is `session_remove`, which waits for the agent's delete command (see the
-Codex adapter): a short bookkeeping command, not an agent making progress, bounded by a 10 second timeout. While it
-runs, tunnel-client delivers no other call, which is the price of a removal that either finishes or fails before it
-returns. There is no fixed time limit beyond that; a call that cannot make progress because the disk is stuck is a
-failure of the box, not something devbox-mcp can bound.
+writes one session record. Two calls do work that grows with data outside devbox-mcp. `session_remove` waits for the
+agent's data to be deleted: Codex's delete command, bounded by a 10 second timeout, or Claude's files and the name scan
+that confirms them gone (a second or two on a large Claude directory). `session_transcript` reads the transcript file
+(about a second per 100 MB). Neither is an agent making progress, and while either runs tunnel-client delivers no other
+call, which is the price of calls that finish or fail before they return. There is no fixed time limit beyond that; a
+call that cannot make progress because the disk is stuck is a failure of the box, not something devbox-mcp can bound.
 
 ## Turn lifecycle
 
@@ -297,8 +339,8 @@ Events are agent-agnostic. Each has a `seq`, a `turn_id`, a `time`, a `type`, an
 - `turn_started { message }`, with the message cut like any text field;
 - `agent_message { text }`;
 - `command_started { item_id, command }` and `command_finished { item_id, command, status, exit_code, output }`, where
-  `status` is `completed`, `failed`, or `declined`, `exit_code` is null when the command did not run to an exit, and
-  `output` is the end of its combined output; `item_id` pairs the two;
+  `status` is `completed`, `failed`, or `declined`, `exit_code` is null when the command did not run to an exit or the
+  agent does not report one (Claude does not), and `output` is the end of its combined output; `item_id` pairs the two;
 - `file_change { item_id, status, changes: [{ path, kind }] }`, where `status` says whether the change was applied
   (`completed`) or not (`failed`);
 - `tool { item_id, name, status }` for other agent tool use the adapter recognizes but has no specific event for, and
@@ -320,9 +362,9 @@ touching the session logic. An agent's module knows how to:
 - locate and read the agent's native transcript for a session (step 4 in TODO.md);
 - delete the agent's stored data for a session (`SES-6`).
 
-With only Codex so far, the boundary is simply `codex.rs`'s functions: no trait, no dynamic dispatch, and nothing for
-the later steps until they are built. The shape of a shared interface is decided when the second agent arrives (step 3),
-from two real examples instead of one guess.
+Each agent is a module (`codex.rs`, `claude.rs`) with the same few functions, and the session logic picks one with a
+`match` on the session's agent. A trait is not needed for two agents; one is worth introducing only if the match
+statements start to repeat or a third agent arrives.
 
 ### Codex
 
@@ -350,9 +392,11 @@ The Codex adapter uses non-interactive mode, checked against codex-cli 0.162.1:
   failure of the removal: Codex reports an already deleted session with the same message and exit status as a real
   failure, and a failure can come after part of the data is already deleted (the rollout before the database rows), so
   devbox-mcp does not try to tell these apart and leaves the decision to the caller's `force`.
-- The native transcript is a rollout file under Codex's home directory (`$CODEX_HOME`, by default `~/.codex`), at
-  `sessions/YYYY/MM/DD/rollout-<timestamp>-<session id>.jsonl`. Codex compresses old rollouts to `.jsonl.zst` and
-  removes the plain file, so reading or deleting a session's native data (steps 2 and 4 in TODO.md) must handle both.
+- The native transcript is a rollout file under Codex's home directory (see "Configuration"), at
+  `sessions/YYYY/MM/DD/rollout-<timestamp>-<session id>.jsonl`, found by walking `sessions/` for a file name ending in
+  `-<session id>.jsonl`. Only plain rollouts are read. A compressed `.jsonl.zst` one, or none at all (Codex 0.162 also
+  keeps history in its own SQLite store and can migrate rollouts there), makes `session_transcript` fail with an error
+  saying so. None of the rollouts on the development box were compressed when this was written.
 - Event mapping, from `--json` output (shapes observed with 0.162.1 where noted, otherwise from Codex's event
   definitions):
   - `item.completed` of an `agent_message` item (observed) gives `agent_message`; the final message is the text of the
@@ -368,6 +412,55 @@ The Codex adapter uses non-interactive mode, checked against codex-cli 0.162.1:
 
 `codex exec` cannot be steered mid-turn and has no live question channel, which is why SPEC.md makes follow-ups new
 turns.
+
+### Claude
+
+The Claude adapter uses Claude Code's print mode, checked against Claude Code 2.1.296:
+
+- Turns: `claude -p --output-format stream-json --verbose --dangerously-skip-permissions --model <model> --effort
+  <effort>`, plus `--session-id <id>` to start the conversation or `--resume <id>` to continue it, with the message on
+  stdin and the child's working directory set to the session's.
+- The bypass flag turns off all of Claude Code's permission checks (`SEC-4`). The user's own Claude Code configuration
+  (`CLAUDE.md`, settings, hooks, skills) stays in force, as Codex's rules do; devbox-mcp passes nothing to disable it.
+  Implementation checks that nothing in print mode waits for an answer nobody can give (a question tool, for example),
+  and disallows such a tool with `--disallowedTools` if one does.
+- The native session ID is chosen by devbox-mcp: a random UUID, saved in the record that accepts the session's first
+  send, before Claude starts. A later send looks for Claude's transcript for that ID first, with three outcomes: exactly
+  one found, so the turn resumes it; the lookup completed and found none, so the turn starts the conversation again
+  under the same ID with `--session-id`, reporting `context_reset` when an earlier turn had run, since the caller cannot
+  otherwise tell whether anything was lost (`SES-5`); or the lookup failed or found more than one, so the send fails and
+  Claude does not start. If a resume then fails because the transcript has gone in the meantime, the turn fails; it is
+  not retried as a fresh start.
+- The `session_id` of the stream's `system` `init` event must match the chosen ID; a mismatch aborts the turn, as with
+  Codex, and marks the session as having an untracked conversation, since Claude may already have stored data under the
+  other ID. Short of that, the ID is always known before Claude runs, so removal can check that the data is gone.
+- Defaults: model `opus`, effort `high`. Efforts are checked at creation (see "Tools"); an unknown model fails the turn
+  with the API's error, which arrives as an error `result` event.
+- Event mapping, from `stream-json` output (shapes observed with 2.1.296):
+  - `text` blocks of `assistant` messages give `agent_message`; the final message is the `result` event's `result`.
+  - A `tool_use` block named `Bash` gives `command_started` (`item_id` is the block's `id`, `command` its
+    `input.command`), and the matching `tool_result` (in a `user` message, same `tool_use_id`) gives `command_finished`:
+    `failed` when `is_error` is true, otherwise `completed`, with a null `exit_code` and the result's text as output.
+  - `tool_use` of `Write` (kind `add`) or `Edit` and `MultiEdit` (kind `update`) gives `file_change` for
+    `input.file_path` when its `tool_result` arrives, `failed` if that is an error.
+  - Any other `tool_use` gives `tool`, named after the tool, when its `tool_result` arrives.
+  - The `result` event ends the turn: `completed` unless `is_error` is true, otherwise `failed` with its `result` text
+    as the reason. An exit without a `result` event is a failure with the process's stderr.
+  - `thinking` blocks and other events give nothing.
+- The native transcript is `projects/<encoded working directory>/<id>.jsonl` under Claude Code's configuration directory
+  (see "Configuration"), found by looking for `<id>.jsonl` in each directory under `projects/` rather than reproducing
+  Claude's encoding of the directory name. Only the main conversation is read; subagents' transcripts, under
+  `<id>/subagents/`, are not.
+- Removing a session's data: there is no Claude command for one session (`claude purge` removes a whole project's
+  sessions, which may include other sessions sharing the working directory), so devbox-mcp deletes them itself:
+  `<id>.jsonl` and `<id>/` in every directory under `projects/`, `session-env/<id>`, and `file-history/<id>`. It then
+  walks the whole configuration directory for any other file or directory whose name contains the ID, and reports the
+  data as deleted only when none is left; anything found makes the removal fail unless forced, and the error names it.
+  The walk is what keeps a Claude update that adds or moves a per-session file from leaving data behind while removal
+  reports it deleted; it cannot see data kept inside files shared between sessions, which this layout (observed with
+  2.1.296) does not have for print-mode sessions. The deletion runs on a blocking thread and completes or fails before
+  the removal returns, so nothing is deleted after the session is back in use; the walk took under two seconds on a
+  13,000-entry Claude directory.
 
 ## Deployment
 
@@ -388,11 +481,13 @@ at its path, so a symlink or hardlink there cannot carry the key into another fi
 `devbox-mcp setup --tunnel-id <id>` never touches the key file and does two things:
 
 - runs `tunnel-client init --force --profile devbox --profile-dir ~/.config/tunnel-client --tunnel-id <id> --mcp-command
-  "<devbox-mcp> --codex-bin <codex>"`, so tunnel-client writes its own profile and devbox-mcp never writes
-  tunnel-client's YAML. `<devbox-mcp>` is the binary running setup. The paths are absolute, because a user service's
-  `PATH` is minimal and does not include the directories they usually live in. The profile directory is explicit, here
-  and in the unit, so an `XDG_CONFIG_HOME` in the shell running setup cannot put the profile where the service does not
-  look;
+  "<devbox-mcp> --codex-bin <codex> [--claude-bin <claude>]"`, so tunnel-client writes its own profile and devbox-mcp
+  never writes tunnel-client's YAML. `<devbox-mcp>` is the binary running setup. `--claude-bin` is added when setup
+  finds `claude` on its `PATH` (or is given `--claude-bin`); without it, Claude sessions use whatever `claude` the
+  service's `PATH` holds, and fail their turns with a clear error if there is none. The paths are absolute, because a
+  user service's `PATH` is minimal and does not include the directories they usually live in. The profile directory is
+  explicit, here and in the unit, so an `XDG_CONFIG_HOME` in the shell running setup cannot put the profile where the
+  service does not look;
 - writes the unit, `~/.config/systemd/user/devbox-mcp.service`, from one fixed piece of text with the absolute paths
   filled in, plus `Environment=PATH=` with the `PATH` setup runs with, so that the agents' commands find the user's
   usual tools rather than only those on the systemd user manager's minimal `PATH`. Relative and empty entries (the

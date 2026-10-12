@@ -38,7 +38,7 @@ What step 1 leaves out of a session's life, so that sessions can be used for rea
 
 Proves the agent-adapter boundary on a second agent before more is built on it.
 
-- [ ] Spec. Claude's adapter in SPEC_impl.md (non-interactive mode, resuming by session ID, permissions bypassed per
+- [x] Spec. Claude's adapter in SPEC_impl.md (non-interactive mode, resuming by session ID, permissions bypassed per
       `SEC-4`, how its output maps to turn events) and anything about agent choice that step 1 left open.
 - [ ] Plan and implement.
 
@@ -47,7 +47,7 @@ Proves the agent-adapter boundary on a second agent before more is built on it.
 Lets the caller see an agent's own record of a session rather than devbox-mcp's summary of it (`TRA-2`), for both
 agents.
 
-- [ ] Spec. The transcript read tool: how ranges are addressed, what an entry looks like, how much of the agent's native
+- [x] Spec. The transcript read tool: how ranges are addressed, what an entry looks like, how much of the agent's native
       format is passed through, and bounds.
 - [ ] Plan and implement.
 
