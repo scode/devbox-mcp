@@ -32,7 +32,7 @@ What step 1 leaves out of a session's life, so that sessions can be used for rea
 
 - [x] Spec. Removing sessions, including the agent's own data (`SES-6`), and choosing model and effort per session
       (`SES-7`). (Default working directories and reporting turns lost to a restart moved into step 1.)
-- [ ] Plan and implement.
+- [x] Plan and implement.
 
 #### Step 3: Claude as a second agent
 

@@ -16,7 +16,8 @@ use rmcp::{ErrorData as McpError, Json, ServerHandler, schemars, tool, tool_hand
 use serde::Deserialize;
 
 use crate::sessions::{
-    ReadResult, SendResult, SessionError, SessionPage, SessionSummary, Sessions, TurnSummary,
+    ReadResult, RemoveResult, SendResult, SessionError, SessionPage, SessionSummary, Sessions,
+    TurnSummary,
 };
 use crate::store::Agent;
 
@@ -81,6 +82,17 @@ pub struct SessionReadParams {
     /// Where to continue from: the `cursor` from `session_send` or the `next_cursor` from your previous read. Omit it to
     /// read from the start of the most recent turn.
     pub cursor: Option<String>,
+}
+
+// Arguments of `session_remove`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SessionRemoveParams {
+    /// The session to remove.
+    pub name: String,
+    /// Remove the session even when devbox-mcp cannot confirm that the agent's stored data for it was deleted, which
+    /// may then remain in the agent's storage. Defaults to false. Use it only when the user wants the session gone
+    /// anyway.
+    pub force: Option<bool>,
 }
 
 // Arguments of `session_interrupt`.
@@ -207,6 +219,30 @@ impl DevboxServer {
     ) -> Result<Json<TurnSummary>, McpError> {
         Ok(Json(self.sessions.interrupt(&params.name)?))
     }
+
+    /// Removes a session (SPEC.md `SES-6`).
+    #[tool(
+        description = "Remove a session you no longer need: deletes the agent's own stored conversation for it and \
+                       forgets the session, so its name can be used again. The session's working directory and the \
+                       files in it are left alone. Returns the session as it was, and whether the agent's data was \
+                       deleted. Fails if the session has a turn running or being interrupted (wait for it to end, or \
+                       stop it with session_interrupt first). Also fails, keeping the session, when devbox-mcp cannot \
+                       confirm that the agent's data was deleted: the agent's delete command failed, or the session \
+                       had a conversation whose ID devbox-mcp never learned (it then cannot delete it). Such a failure \
+                       says why; retrying may help if the cause was temporary. Only pass `force: true` when the user \
+                       wants the session gone even if the agent's data may remain; do not use it by default. This \
+                       call waits up to 10 seconds for the agent's delete command."
+    )]
+    async fn session_remove(
+        &self,
+        Parameters(params): Parameters<SessionRemoveParams>,
+    ) -> Result<Json<RemoveResult>, McpError> {
+        Ok(Json(
+            self.sessions
+                .remove(&params.name, params.force.unwrap_or(false))
+                .await?,
+        ))
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -221,10 +257,11 @@ impl ServerHandler for DevboxServer {
                  directory, that you can come back to later with its context intact. Typical use: session_create once, \
                  then session_send a message (it returns at once; the agent works in the background), then \
                  session_read with the returned cursor, repeatedly, until the turn's state is neither `running` nor \
-                 `interrupting` and `more` is false; the agent's reply is the turn's `final_message`. Send follow-ups to the same session. No call ever waits \
-                 for the agent, so pace your reads (every few seconds at most, or after doing other work), and expect \
-                 long turns to take minutes. Use session_list to find earlier sessions, and session_interrupt to stop \
-                 a turn.",
+                 `interrupting` and `more` is false; the agent's reply is the turn's `final_message`. Send follow-ups \
+                 to the same session. No call ever waits for the agent, so pace your reads (every few seconds at most, \
+                 or after doing other work), and expect long turns to take minutes. Use session_list to find earlier \
+                 sessions, session_interrupt to stop a turn, and session_remove to delete a session you no longer \
+                 need.",
             )
     }
 }

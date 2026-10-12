@@ -9,6 +9,8 @@
 use std::future::Future;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -20,6 +22,15 @@ pub const DEFAULT_MODEL: &str = "gpt-6.1-sol";
 
 /// Default reasoning effort for Codex sessions, per SPEC_impl.md.
 pub const DEFAULT_EFFORT: &str = "high";
+
+/// How long removing a session waits for `codex delete` before giving up (SPEC_impl.md, "Codex").
+pub const DELETE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How much of `codex delete`'s output a failed removal reports, so an error never grows without bound (`BND-1`).
+const DELETE_OUTPUT_BYTES: usize = 2 * 1024;
+
+/// Ends `codex delete` output that was cut to [`DELETE_OUTPUT_BYTES`] (`BND-1` asks for cuts to be marked).
+const CUT_MARK: &str = " [cut]";
 
 /// How to reach the Codex executable.
 #[derive(Debug, Clone)]
@@ -75,6 +86,69 @@ pub struct Outcome {
 }
 
 impl Codex {
+    /// Deletes Codex's stored data for a session with `codex delete --force <native id>`, for removing a session
+    /// (SPEC.md `SES-6`): the rollout file and Codex's database rows, as checked with codex-cli 0.162.1.
+    ///
+    /// The command runs with devbox-mcp's own environment, like the turns, so it works on the same Codex home. If it
+    /// has not finished within `timeout`, its whole process group is killed and the command reaped before this
+    /// returns, so it can never delete anything after the session is back in use. The group matters because `codex`
+    /// may be a launcher (the npm package is a script that starts the real binary as a child), and killing only the
+    /// launcher would leave the deleting process running. Any failure is returned as such, with the command's output
+    /// cut to 2 KiB and marked when cut: Codex
+    /// reports an already deleted session exactly like a real failure, and can fail after deleting part of the data, so
+    /// telling these apart is left to the caller's `force` rather than guessed here.
+    pub async fn delete(&self, native_id: &str, timeout: Duration) -> Result<(), String> {
+        let mut cmd = tokio::process::Command::new(&self.bin);
+        cmd.args(["delete", "--force", native_id])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        process::contain(&mut cmd);
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("cannot run {}: {e}", self.bin.display()))?;
+        let stdout = child.stdout.take().expect("stdout is piped");
+        let stderr = child.stderr.take().expect("stderr is piped");
+        // One byte more than kept, so a cut can be told apart from output that fit exactly.
+        let finished = tokio::time::timeout(timeout, async {
+            tokio::join!(
+                process::read_bounded(stdout, DELETE_OUTPUT_BYTES + 1),
+                process::read_bounded(stderr, DELETE_OUTPUT_BYTES + 1),
+                child.wait(),
+            )
+        })
+        .await;
+        let Ok((stdout, stderr, status)) = finished else {
+            // The command leads its own process group (`process::contain`) and is not reaped yet, so the group ID
+            // cannot have been reused: killing the group reaches only the command and what it started.
+            if let Some(pid) = child.id().and_then(|pid| libc::pid_t::try_from(pid).ok()) {
+                // SAFETY: killpg only sends a signal; the arguments are plain integers.
+                unsafe { libc::killpg(pid, libc::SIGKILL) };
+            }
+            // `kill` waits for the command too, which is the reap the spec asks for.
+            let _ = child.kill().await;
+            return Err(format!(
+                "codex delete did not finish within {} seconds and was stopped",
+                timeout.as_secs()
+            ));
+        };
+        let status = status.map_err(|e| format!("cannot wait for codex delete: {e}"))?;
+        if status.success() {
+            return Ok(());
+        }
+        let read_cut = stdout.len() > DELETE_OUTPUT_BYTES || stderr.len() > DELETE_OUTPUT_BYTES;
+        let output = format!("{}\n{}", stderr.trim(), stdout.trim());
+        let (mut output, cut) = crate::events::truncate(
+            output.trim(),
+            DELETE_OUTPUT_BYTES - CUT_MARK.len(),
+            Keep::Head,
+        );
+        if cut || read_cut {
+            output.push_str(CUT_MARK);
+        }
+        Err(format!("codex delete failed ({status}): {output}"))
+    }
+
     /// Builds the argument list for a turn.
     ///
     /// Sandbox and approvals are bypassed because SPEC.md `SEC-4` requires launched agents to run with full access and
@@ -381,6 +455,77 @@ struct RawError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stand-in Codex for `delete`: a shell script with the given body, in a fresh temporary directory.
+    fn fake_codex(body: &str) -> (tempfile::TempDir, Codex) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::TempDir::new().unwrap();
+        let bin = dir.path().join("codex");
+        std::fs::write(&bin, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (dir, Codex { bin })
+    }
+
+    /// Removal asks Codex to delete a session by its native ID, and a clean exit is success.
+    #[tokio::test]
+    async fn delete_passes_the_native_id() {
+        let (dir, codex) = fake_codex(r#"printf '%s\n' "$@" > "$(dirname "$0")/argv""#);
+        codex.delete("abc-123", DELETE_TIMEOUT).await.unwrap();
+        let argv = std::fs::read_to_string(dir.path().join("argv")).unwrap();
+        assert_eq!(argv, "delete\n--force\nabc-123\n");
+    }
+
+    /// A failed delete is reported with Codex's output, cut so that an error never grows without bound (`BND-1`).
+    #[tokio::test]
+    async fn delete_failure_output_is_bounded() {
+        let (_dir, codex) = fake_codex("head -c 100000 /dev/zero | tr '\\0' x >&2; exit 1");
+        let error = codex.delete("id", DELETE_TIMEOUT).await.unwrap_err();
+        assert!(error.starts_with("codex delete failed"), "{error}");
+        assert!(error.ends_with(CUT_MARK), "{error}");
+        assert!(
+            error.len() < DELETE_OUTPUT_BYTES + 100,
+            "{} bytes",
+            error.len()
+        );
+    }
+
+    /// A delete that does not finish in time is killed and reaped before `delete` returns, so it can never delete
+    /// anything after the session is back in use (SPEC_impl.md, "Codex").
+    #[tokio::test]
+    async fn delete_timeout_kills_and_reaps_the_command() {
+        let (dir, codex) = fake_codex(r#"echo $$ > "$(dirname "$0")/pid"; exec sleep 60"#);
+        let started = std::time::Instant::now();
+        let error = codex
+            .delete("id", Duration::from_millis(300))
+            .await
+            .unwrap_err();
+        assert!(error.contains("did not finish"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let pid = std::fs::read_to_string(dir.path().join("pid")).unwrap();
+        // Reaped, not just killed: a zombie would still have a /proc entry.
+        assert!(!std::path::Path::new(&format!("/proc/{}", pid.trim())).exists());
+    }
+
+    /// A timed-out delete run through a launcher (as the npm-installed `codex` is) is stopped as a whole: the
+    /// launcher's own child, which would do the actual deleting, must not outlive the timeout and delete later.
+    #[tokio::test]
+    async fn delete_timeout_stops_a_launchers_child_too() {
+        let (dir, codex) = fake_codex(
+            r#"d=$(dirname "$0"); (sleep 2; touch "$d/late-delete") & echo $! > "$d/worker"; wait"#,
+        );
+        let error = codex
+            .delete("id", Duration::from_millis(300))
+            .await
+            .unwrap_err();
+        assert!(error.contains("did not finish"), "{error}");
+        let worker = std::fs::read_to_string(dir.path().join("worker")).unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            !dir.path().join("late-delete").exists(),
+            "the launcher's child kept running (pid {})",
+            worker.trim()
+        );
+    }
 
     /// Feeds lines through a turn, collecting what it reports, and returns that with the turn.
     fn feed(

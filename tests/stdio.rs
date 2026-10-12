@@ -31,6 +31,7 @@ async fn lists_the_tools() {
             "session_interrupt",
             "session_list",
             "session_read",
+            "session_remove",
             "session_send"
         ]
     );

@@ -96,6 +96,25 @@ pub struct Record {
     /// Every request ID accepted for this session (absent in records written before request IDs existed).
     #[serde(default)]
     pub requests: Vec<AcceptedRequest>,
+    /// Whether a send has had to start a fresh conversation because the previous one could not be resumed
+    /// (`context_reset`, SPEC.md `SES-5`). The agent may still hold that earlier conversation, but devbox-mcp never
+    /// learned its ID and so cannot delete it; removing the session then needs `force` (`SES-6`). Once true, never
+    /// cleared. Absent (`None`) in records written before this was tracked, where nobody knows; see
+    /// [`Record::may_have_untracked_conversation`].
+    #[serde(default)]
+    pub untracked_conversation: Option<bool>,
+}
+
+impl Record {
+    /// Whether the agent may hold a conversation of this session that devbox-mcp cannot name, so removal cannot confirm
+    /// it deleted everything (SPEC_impl.md, "Storage"). For a record written before that was tracked, only a session
+    /// that never got past its first turn is known to have none, since a context reset needs an earlier turn.
+    pub fn may_have_untracked_conversation(&self) -> bool {
+        match self.untracked_conversation {
+            Some(untracked) => untracked,
+            None => self.turn.as_ref().is_some_and(|t| t.id > 1),
+        }
+    }
 }
 
 /// The state directory: its lock and its session records.
@@ -233,6 +252,20 @@ impl Store {
             .and_then(|()| file.sync_all())
             .with_context(|| format!("cannot write {}", tmp.display()))?;
         fs::rename(&tmp, &path).with_context(|| format!("cannot replace {}", path.display()))?;
+        Ok(())
+    }
+
+    /// Deletes a session's record, the last step of removing a session (SPEC_impl.md, "Storage"). A record that is
+    /// already gone counts as deleted. A temporary file left by an interrupted write is removed too, on a best-effort
+    /// basis: it would only be ignored at the next load, but should not outlive the session.
+    pub fn remove(&self, name: &str) -> anyhow::Result<()> {
+        let path = self.sessions_dir.join(format!("{name}.json"));
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("cannot delete {}", path.display())),
+        }
+        let _ = fs::remove_file(self.sessions_dir.join(format!("{name}.json.tmp")));
         Ok(())
     }
 }

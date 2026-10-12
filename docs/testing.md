@@ -84,6 +84,15 @@ on, so a manual run against it would wait and then fail). Several `TOOL JSON` pa
 against the same server process; use that whenever a later call depends on state from an earlier one, because each
 invocation of the driver starts a fresh server.
 
+Removing a session deletes the agent's own stored conversation for it (`codex delete`). For manual runs that remove
+sessions, give Codex a scratch home of its own, so nothing in your real `~/.codex` can be deleted: make a fresh
+directory, copy `~/.codex/config.toml` into it (and `auth.json`, if your Codex logs in rather than using a provider that
+needs no login), and set `CODEX_HOME` to it when running the driver or the client below. devbox-mcp passes its
+environment on to Codex, and the driver's tunnel mode lets `CODEX_HOME` through. To check that a removal really deleted
+the conversation, look for the rollout file under `$CODEX_HOME/sessions` and for its row in the `threads` table of
+`$CODEX_HOME/state_5.sqlite` before and after (both named by the session's native ID, the `native_id` in its record
+under `--state-dir`).
+
 Expect `wait_turn` to show the events `turn_started`, `agent_message`, and `turn_ended`, and a turn with state
 `completed` and the agent's reply in `final_message`. A hello world turn took about 10 seconds when this was written.
 Adding a second `session_send` and `wait_turn` to the same session, asking the agent about its previous turn, checks
@@ -141,6 +150,12 @@ made and what came back. The prompts used so far:
   something was started on my dev box in a session named nightly. Find out how it went, and if it did not finish, run it
   again, but with 'sleep 5' instead of 'sleep 300', and tell me the result." Expect the model to find the turn `lost`,
   and send again to the same session.
+- Removing a busy session: "On my dev box, have an agent in a session named scratch run the shell command 'sleep 120'
+  and then reply with the word done. Right after starting it, I changed my mind: get rid of that session entirely."
+  Expect the model to stop the turn (straight away, or after `session_remove` fails as busy), then remove the session
+  without `force`. If the turn was interrupted before Codex reported its conversation ID, as happened when this was
+  first run, removal is refused because devbox-mcp cannot confirm the deletion, and the model should tell the user and
+  ask rather than force it. Reaching for `force` on its own is misuse.
 
 A model with nothing else to do polls `session_read` back to back, since print mode has no way to wait; around 70 reads
 for a 90-second turn were seen, and say nothing about the descriptions. So the budget is generous but finite: a scenario

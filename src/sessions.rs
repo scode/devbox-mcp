@@ -1,10 +1,11 @@
 //! The session table: every session devbox-mcp knows, in memory, backed by [`Store`] records.
 //!
-//! Tool handlers call into this; it owns the rules of SPEC.md "Sessions" (names, working directories, listing) and
-//! "Turns" (sends, reads with cursors, interrupts, request IDs), runs each turn as a background task, and keeps memory
-//! and the records in step. The table sits behind a `std::sync::Mutex` that is never held across an
-//! `.await`, so on devbox-mcp's single-threaded runtime it is never contended; it exists to satisfy the type system
-//! and to keep each operation's read-modify-write atomic.
+//! Tool handlers call into this; it owns the rules of SPEC.md "Sessions" (names, working directories, model and effort,
+//! listing, removal) and "Turns" (sends, reads with cursors, interrupts, request IDs), runs each turn as a background
+//! task, and keeps memory and the records in step. The table sits behind a `std::sync::Mutex` that is never held across
+//! an `.await`, so on devbox-mcp's single-threaded runtime it is never contended; it exists to satisfy the type system
+//! and to keep each operation's read-modify-write atomic. The one call that waits (`remove`, for the agent's delete
+//! command) releases it while waiting and marks the session instead.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
@@ -52,7 +53,8 @@ pub struct Sessions {
     config: Config,
     table: Mutex<Table>,
     /// Identifies this devbox-mcp process in cursors, so a cursor issued before a restart is recognized as such
-    /// (SPEC_impl.md, "Tools"). Startup time plus PID: unique enough for that, without a randomness dependency.
+    /// (SPEC_impl.md, "Tools"). Startup time plus PID: unique enough for that, without a randomness dependency. Each
+    /// session's cursors carry it together with the session's incarnation (see [`Session::epoch`]).
     epoch: String,
 }
 
@@ -61,21 +63,44 @@ struct Table {
     sessions: BTreeMap<String, Session>,
     /// Names of records that could not be parsed; such a name cannot be reused until the file is dealt with.
     unreadable: BTreeSet<String>,
+    /// The incarnation the next session to enter the table gets; counts up across the process.
+    next_incarnation: u64,
+}
+
+impl Table {
+    /// Puts a session into the table as a new incarnation, with the cursor epoch that goes with it.
+    fn insert(&mut self, process_epoch: &str, record: Record) -> &mut Session {
+        let epoch = format!("{process_epoch}-{}", self.next_incarnation);
+        self.next_incarnation += 1;
+        let name = record.name.clone();
+        self.sessions
+            .insert(name.clone(), Session::new(record, epoch));
+        self.sessions.get_mut(&name).expect("just inserted")
+    }
 }
 
 /// A session's durable record plus what only lives in memory: the event stream of its most recent turn and the handle
 /// of a running turn.
 struct Session {
     record: Record,
+    /// The cursor epoch of this incarnation of the session: the process's epoch plus a number given when the session
+    /// entered the table. A session created under the name of a removed one gets a different number, so the removed
+    /// session's cursors are treated like cursors from another process instead of silently matching the new session's
+    /// sequence numbers (SPEC_impl.md, "Tools").
+    epoch: String,
     /// Events of the most recent turn that ran in this process, oldest first, at most [`MAX_HELD_EVENTS`].
     events: VecDeque<Event>,
-    /// Sequence number the next event gets; counts up from 1 within this process.
+    /// Sequence number the next event gets; counts up from 1 within this incarnation of the session.
     next_seq: u64,
     /// Sequence number of the most recent turn's first event, if that turn ran in this process.
     turn_start_seq: Option<u64>,
     last_event_at: Option<DateTime<Utc>>,
     /// Present while a turn's task is running, until the turn is settled.
     running: Option<Running>,
+    /// Set while `remove` waits for the agent to delete its data, so that no turn can start (and no second removal
+    /// can begin) on a session that is going away. In memory only: it cannot outlive the wait, and a restart in the
+    /// middle of one simply leaves the session in place.
+    removing: bool,
 }
 
 /// The handle of a running turn.
@@ -85,15 +110,42 @@ struct Running {
 }
 
 impl Session {
-    fn new(record: Record) -> Self {
+    fn new(record: Record, epoch: String) -> Self {
         Self {
             record,
+            epoch,
             events: VecDeque::new(),
             next_seq: 1,
             turn_start_seq: None,
             last_event_at: None,
             running: None,
+            removing: false,
         }
+    }
+
+    /// The error for a send or removal while this session is busy: its most recent turn is still running or being
+    /// interrupted, or the session is being removed. `None` when it is free.
+    fn busy_error(&self) -> Option<SessionError> {
+        let name = &self.record.name;
+        if self.removing {
+            return Some(SessionError::Invalid(format!(
+                "session {name:?} is being removed; check session_list in a moment to see whether it is gone"
+            )));
+        }
+        let turn = self
+            .record
+            .turn
+            .as_ref()
+            .filter(|t| !t.state.is_terminal())?;
+        Some(SessionError::Invalid(format!(
+            "session {name:?} is busy: turn {} is still {}. Poll session_read until it ends, or stop it with \
+             session_interrupt, then try again",
+            turn.id,
+            serde_json::to_value(turn.state)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .unwrap_or_default()
+        )))
     }
 }
 
@@ -206,24 +258,24 @@ impl Sessions {
     /// kept out of the table, and block their names (SPEC_impl.md, "Storage").
     pub fn new(store: Store, config: Config) -> anyhow::Result<Self> {
         let loaded = store.load()?;
-        let sessions = loaded
-            .records
-            .into_iter()
-            .map(|record| (record.name.clone(), Session::new(record)))
-            .collect();
         let epoch = format!(
             "{:x}{:x}",
             Utc::now().timestamp_nanos_opt().unwrap_or_default(),
             std::process::id()
         );
+        let mut table = Table {
+            sessions: BTreeMap::new(),
+            unreadable: loaded.unreadable.into_iter().collect(),
+            next_incarnation: 0,
+        };
+        for record in loaded.records {
+            table.insert(&epoch, record);
+        }
         Ok(Self {
             store,
             config,
             epoch,
-            table: Mutex::new(Table {
-                sessions,
-                unreadable: loaded.unreadable.into_iter().collect(),
-            }),
+            table: Mutex::new(table),
         })
     }
 
@@ -289,14 +341,12 @@ impl Sessions {
             native_id: None,
             turn: None,
             requests: Vec::new(),
+            untracked_conversation: Some(false),
         };
         self.store.write(&record).map_err(|e| {
             SessionError::Internal(format!("could not save the new session: {e:#}"))
         })?;
-        let session = Session::new(record);
-        let summary = session.summary();
-        table.sessions.insert(name.to_owned(), session);
-        Ok(summary)
+        Ok(table.insert(&self.epoch, record).summary())
     }
 
     /// Lists sessions in name order, a page at a time, starting after the name `after` (SPEC.md `SES-4`).
@@ -343,6 +393,17 @@ const MAX_FINAL_MESSAGE_BYTES: usize = 32 * 1024;
 const MAX_ERROR_BYTES: usize = 4 * 1024;
 /// Ends a failure reason that was cut to [`MAX_ERROR_BYTES`].
 const CUT_MARK: &str = " [cut]";
+
+/// What `session_remove` returns.
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct RemoveResult {
+    /// The session as it was just before it was removed.
+    pub session: SessionSummary,
+    /// True when the agent's own stored data for the session (its conversation) was deleted, or there never was any.
+    /// False only for a forced removal, when that data could not be deleted or devbox-mcp could not tell; it may then
+    /// remain in the agent's storage.
+    pub agent_data_deleted: bool,
+}
 
 /// What `session_send` returns.
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
@@ -454,19 +515,20 @@ impl Session {
     }
 
     /// A cursor positioned just before `turn_id`'s first event, if that turn's events are still held.
-    fn cursor_before_turn(&self, turn_id: u64, epoch: &str) -> Option<String> {
+    fn cursor_before_turn(&self, turn_id: u64) -> Option<String> {
         let current = self.record.turn.as_ref().map(|t| t.id);
         match self.turn_start_seq {
             Some(start) if current == Some(turn_id) && start >= self.oldest_held() => {
-                Some(cursor(&self.record.name, epoch, start - 1))
+                Some(cursor(&self.record.name, &self.epoch, start - 1))
             }
             _ => None,
         }
     }
 }
 
-/// Formats a cursor: the session, the issuing process's epoch, and the last event seen. Session names cannot contain
-/// `:` (`SES-2`), so splitting from the right is unambiguous.
+/// Formats a cursor: the session, the epoch of the session incarnation that issued it (see [`Session::epoch`]), and the
+/// last event seen. Session names cannot contain `:` (`SES-2`), and epochs do not either, so splitting from the right is
+/// unambiguous.
 fn cursor(name: &str, epoch: &str, seq: u64) -> String {
     format!("{name}:{epoch}:{seq}")
 }
@@ -620,23 +682,13 @@ impl Sessions {
             return Ok(SendResult {
                 turn_id: earlier.turn_id,
                 replayed: true,
-                cursor: session.cursor_before_turn(earlier.turn_id, &self.epoch),
+                cursor: session.cursor_before_turn(earlier.turn_id),
                 context_reset: earlier.context_reset,
             });
         }
 
-        if let Some(turn) = &session.record.turn
-            && !turn.state.is_terminal()
-        {
-            return Err(SessionError::Invalid(format!(
-                "session {name:?} is busy: turn {} is still {}. Poll session_read until it ends, or stop it with \
-                 session_interrupt, then send again",
-                turn.id,
-                serde_json::to_value(turn.state)
-                    .ok()
-                    .and_then(|v| v.as_str().map(str::to_owned))
-                    .unwrap_or_default()
-            )));
+        if let Some(busy) = session.busy_error() {
+            return Err(busy);
         }
 
         // A conversation that once existed but whose native ID devbox-mcp never learned (the first turn was lost before
@@ -644,6 +696,9 @@ impl Sessions {
         let context_reset = session.record.native_id.is_none() && session.record.turn.is_some();
         let turn_id = session.record.turn.as_ref().map_or(1, |t| t.id + 1);
         let mut record = session.record.clone();
+        // Saved with the turn itself, so a removal can never miss that an earlier conversation may still exist.
+        record.untracked_conversation =
+            Some(record.may_have_untracked_conversation() || context_reset);
         record.turn = Some(TurnRecord {
             id: turn_id,
             state: TurnState::Running,
@@ -682,7 +737,7 @@ impl Sessions {
         let result = SendResult {
             turn_id,
             replayed: false,
-            cursor: session.cursor_before_turn(turn_id, &self.epoch),
+            cursor: session.cursor_before_turn(turn_id),
             context_reset,
         };
         let workdir = session.record.workdir.clone();
@@ -827,6 +882,90 @@ impl Sessions {
         session.running = None;
     }
 
+    /// Removes a session (SPEC.md `SES-6`, SPEC_impl.md "Tools"): deletes the agent's stored data for it, then its
+    /// record, and forgets it; its working directory is left alone.
+    ///
+    /// Refused while the session is busy. Without `force`, also refused when deletion cannot be confirmed: the session
+    /// had a turn but no native ID was ever learned, or an earlier conversation was orphaned by a context reset (both
+    /// checked before anything is deleted), or the agent's delete command fails. A failure keeps the session, though
+    /// the agent may already have deleted part of its data. With `force`, the session is forgotten anyway and the
+    /// result says the agent's data may remain.
+    ///
+    /// This is the one call that waits on a subprocess (the agent's delete command, bounded by
+    /// [`codex::DELETE_TIMEOUT`]). The table lock is not held during that wait; the session's `removing` flag keeps
+    /// sends and other removals out instead, and since nothing can create, remove, or start a turn on the name while it
+    /// is set, nothing needs re-checking afterwards. rmcp does not drop a handler when the client cancels the call, so
+    /// the flag is always cleared on the way out; only shutdown drops this future, and the flag dies with the process.
+    pub async fn remove(&self, name: &str, force: bool) -> Result<RemoveResult, SessionError> {
+        let (native_id, confirmable) = {
+            let mut table = self.table.lock().unwrap();
+            let session = table
+                .sessions
+                .get_mut(name)
+                .ok_or_else(|| not_found(name))?;
+            if let Some(busy) = session.busy_error() {
+                return Err(busy);
+            }
+            let record = &session.record;
+            let confirmable = record.turn.is_none()
+                || (record.native_id.is_some() && !record.may_have_untracked_conversation());
+            if !confirmable && !force {
+                let why = if record.may_have_untracked_conversation() {
+                    "an earlier conversation of this session may remain whose ID devbox-mcp never learned (it was \
+                     left behind by a context reset, or the record predates devbox-mcp keeping track of that)"
+                } else {
+                    "the agent never reported an ID for this session's conversation"
+                };
+                return Err(SessionError::Invalid(format!(
+                    "cannot confirm that removing session {name:?} would delete all of the agent's stored data: \
+                     {why}, so that data may remain in the agent's storage and devbox-mcp cannot delete it. The \
+                     session is kept. Pass force: true to remove it anyway"
+                )));
+            }
+            session.removing = true;
+            (record.native_id.clone(), confirmable)
+        };
+
+        let deleted = match &native_id {
+            Some(id) => self.config.codex.delete(id, codex::DELETE_TIMEOUT).await,
+            None => Ok(()),
+        };
+
+        let mut table = self.table.lock().unwrap();
+        let session = table
+            .sessions
+            .get_mut(name)
+            .expect("a session being removed stays in the table");
+        if let Err(e) = &deleted
+            && !force
+        {
+            session.removing = false;
+            return Err(SessionError::Internal(format!(
+                "could not delete the agent's stored data for session {name:?}, so the session is kept: {e}. The agent \
+                 may already have deleted part of that data. Try again, or pass force: true to remove the session \
+                 anyway, leaving whatever the agent still holds"
+            )));
+        }
+        let summary = session.summary();
+        if let Err(e) = self.store.remove(name) {
+            session.removing = false;
+            return Err(SessionError::Internal(format!(
+                "could not delete session {name:?}'s record, so the session is kept: {e:#}. The agent's own data for \
+                 it {} already deleted; try again to finish the removal",
+                if native_id.is_some() && deleted.is_ok() {
+                    "was"
+                } else {
+                    "may be"
+                }
+            )));
+        }
+        table.sessions.remove(name);
+        Ok(RemoveResult {
+            session: summary,
+            agent_data_deleted: confirmable && deleted.is_ok(),
+        })
+    }
+
     /// Starts interrupting a session's running turn and returns at once (SPEC.md `TRN-4`, `BND-2`). The turn reports
     /// `interrupting` until its agent and everything it started are gone; callers follow it with `session_read`.
     pub fn interrupt(&self, name: &str) -> Result<TurnSummary, SessionError> {
@@ -886,7 +1025,7 @@ impl Sessions {
                         shown(cursor_name)
                     )));
                 }
-                if epoch != self.epoch || seq > newest || seq + 1 < oldest {
+                if epoch != session.epoch || seq > newest || seq + 1 < oldest {
                     (oldest - 1, true)
                 } else {
                     (seq, false)
@@ -912,7 +1051,7 @@ impl Sessions {
         };
         Ok(ReadResult {
             events,
-            next_cursor: cursor(name, &self.epoch, last),
+            next_cursor: cursor(name, &session.epoch, last),
             more,
             gap,
             turn: turn.map(TurnDetail::from_record),

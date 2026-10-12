@@ -46,9 +46,22 @@ use tempfile::TempDir;
 /// If a file named `noisy` exists next to the fake, it writes 256 KiB to stderr before reading its prompt, which
 /// deadlocks against a large prompt unless devbox-mcp drains output while still writing the prompt.
 ///
+/// Run as `delete --force <id>` (how devbox-mcp removes a session's data), it records its argv, one line per argument
+/// and a blank line after each call, in `delete-argv`, and behaves according to a file named `delete-mode` next to it:
+/// absent or `ok` succeeds, `fail` prints an error and exits 1 (as real Codex does for a session that is already gone),
+/// and `hang` writes its PID to `delete-pid` and sleeps for a minute in its place, for testing the timeout.
+///
 /// It is a shell script because the fake has to be a standalone executable and `sh` is everywhere these tests run.
 pub const FAKE_CODEX: &str = r#"#!/bin/sh
 dir=$(dirname "$0")
+if [ "$1" = delete ]; then
+  printf '%s\n' "$@" "" >> "$dir/delete-argv"
+  case "$(cat "$dir/delete-mode" 2>/dev/null)" in
+    fail) echo "Error: failed to delete session" >&2; exit 1 ;;
+    hang) echo $$ > "$dir/delete-pid"; exec sleep 60 ;;
+  esac
+  exit 0
+fi
 printf '%s\n' "$@" > "$dir/argv"
 echo "$PPID" > "$dir/ppid"
 if [ -f "$dir/noisy" ]; then
