@@ -133,6 +133,16 @@ fn main() -> anyhow::Result<()> {
     result
 }
 
+/// The Unix user devbox-mcp (and so every agent) runs as, for the server instructions: `$USER`, which systemd and login
+/// shells set, or the numeric user ID when it is missing. Only for telling callers; nothing depends on it.
+fn unix_user() -> String {
+    match std::env::var("USER") {
+        Ok(user) if !user.is_empty() => user,
+        // SAFETY: getuid has no preconditions and cannot fail.
+        _ => format!("with user ID {}", unsafe { libc::getuid() }),
+    }
+}
+
 /// Serves MCP over stdio until the client goes away or devbox-mcp is told to stop.
 ///
 /// Every way out of here leads to an orderly shutdown in `main`. That is why SIGTERM and SIGINT are caught instead of
@@ -143,7 +153,7 @@ async fn serve(sessions: Arc<sessions::Sessions>) -> anyhow::Result<()> {
     let mut sigterm = signal(SignalKind::terminate()).context("cannot install SIGTERM handler")?;
     let mut sigint = signal(SignalKind::interrupt()).context("cannot install SIGINT handler")?;
 
-    let server = server::DevboxServer::new(sessions);
+    let server = server::DevboxServer::new(sessions, &unix_user());
     let service = tokio::select! {
         service = server.serve(rmcp::transport::stdio()) => service.context("MCP initialization failed")?,
         _ = sigterm.recv() => return Ok(()),

@@ -261,7 +261,12 @@ description.
 
 The instructions tell callers how to poll: there is no way to wait inside devbox-mcp, so a caller with nothing else to
 do should space out reads (for example, check back after doing other work, or every few seconds at most) rather than
-read in a tight loop, and should expect long turns to take minutes.
+read in a tight loop, and should expect long turns to take minutes. They also describe how agents run, naming the Unix
+user devbox-mcp runs as (from `$USER`, or the user ID when that is unset): no sandbox, no approval prompts, unrestricted
+network access, and commands without a terminal and with empty input, so most prompts fail at once. They do not promise
+that every prompt fails: a program may treat end of input as a reason to ask again, and nothing times commands out, so
+the instructions ask callers to keep agents non-interactive and to interrupt a turn that stops producing events. A
+caller handing an agent real work needs to know this, and it was checked on a deployed service.
 
 Two checks keep it honest:
 

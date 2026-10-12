@@ -107,14 +107,19 @@ pub struct SessionInterruptParams {
 pub struct DevboxServer {
     sessions: Arc<Sessions>,
     tool_router: ToolRouter<Self>,
+    /// The server instructions, built once at startup because they name the Unix user the agents run as.
+    instructions: Arc<str>,
 }
 
 #[tool_router]
 impl DevboxServer {
-    pub fn new(sessions: Arc<Sessions>) -> Self {
+    /// A server for `sessions`, whose agents run as `unix_user` (named in the instructions, so a caller knows whose
+    /// files and credentials the agents work with).
+    pub fn new(sessions: Arc<Sessions>, unix_user: &str) -> Self {
         Self {
             sessions,
             tool_router: Self::tool_router(),
+            instructions: instructions(unix_user).into(),
         }
     }
 
@@ -123,8 +128,9 @@ impl DevboxServer {
         description = "Create a new session: a long-lived conversation with a coding agent (Codex) that runs on this \
                        Linux box with full access to it, working in one directory. Create one per piece of work you \
                        want to come back to; later messages to the same session keep the agent's context. You may \
-                       choose the model and reasoning effort; both are fixed for the session's life. Returns the \
-                       session. Fails if the name is invalid or already taken: an existing session with that name is \
+                       choose the model and reasoning effort; both are fixed for the session's life and shown in the \
+                       returned session, and one the agent does not support makes the session's turns fail with the \
+                       agent's own error rather than being ignored. Returns the session. Fails if the name is invalid or already taken: an existing session with that name is \
                        shown in the error, so if it is yours, keep using it instead of creating another. Next, give \
                        the agent work with session_send."
     )]
@@ -250,18 +256,42 @@ impl ServerHandler for DevboxServer {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             // Not `Implementation::from_build_env()`: that macro expands inside rmcp and reports rmcp's own name and version.
-            .with_server_info(Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
-            .with_instructions(
-                "devbox-mcp runs coding agents (Codex) on a remote Linux box, with full access to it, on your behalf. \
-                 Work happens in sessions: a session is a long-lived conversation with one agent, working in one \
-                 directory, that you can come back to later with its context intact. Typical use: session_create once, \
-                 then session_send a message (it returns at once; the agent works in the background), then \
-                 session_read with the returned cursor, repeatedly, until the turn's state is neither `running` nor \
-                 `interrupting` and `more` is false; the agent's reply is the turn's `final_message`. Send follow-ups \
-                 to the same session. No call ever waits for the agent, so pace your reads (every few seconds at most, \
-                 or after doing other work), and expect long turns to take minutes. Use session_list to find earlier \
-                 sessions, session_interrupt to stop a turn, and session_remove to delete a session you no longer \
-                 need.",
-            )
+            .with_server_info(Implementation::new(
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(self.instructions.to_string())
     }
+}
+
+/// The server instructions (SPEC.md `DOC-1`): what devbox-mcp is, the workflow, and the execution environment a caller
+/// needs to know before handing an agent real work.
+///
+/// The environment part was checked on a deployed service: commands run without a terminal and with stdin at end of
+/// file, so `read`, `getpass`, and ssh fail at once instead of prompting, and network access works. That holds for
+/// programs that give up on end of input, not for all of them, which is why the text promises no more than that.
+fn instructions(unix_user: &str) -> String {
+    format!(
+        "devbox-mcp runs coding agents (Codex) on a remote Linux box, with full access to it, on your behalf. \
+         Work happens in sessions: a session is a long-lived conversation with one agent, working in one \
+         directory, that you can come back to later with its context intact. Typical use: session_create once, \
+         then session_send a message (it returns at once; the agent works in the background), then \
+         session_read with the returned cursor, repeatedly, until the turn's state is neither `running` nor \
+         `interrupting` and `more` is false; the agent's reply is the turn's `final_message`. Send follow-ups \
+         to the same session. No call ever waits for the agent, so pace your reads (every few seconds at most, \
+         or after doing other work), and expect long turns to take minutes. Use session_list to find earlier \
+         sessions, session_interrupt to stop a turn, and session_remove to delete a session you no longer \
+         need.\n\n\
+         How agents run: as the Unix user {unix_user}, with no sandbox, no approval prompts, and unrestricted \
+         network access, so an agent can do whatever that user can do on this box, with that user's files and \
+         credentials and the programs on the PATH devbox-mcp was set up with. It works in its session's working \
+         directory. Commands get no terminal and empty input, so most programs that would ask for input (a \
+         password prompt, an ssh login, a confirmation) fail at once and the failure shows up in the turn's events. \
+         A program may handle missing input differently, though, for example by asking again forever, and nothing \
+         times commands out, so ask the agent to run things non-interactively; if a turn stops producing events \
+         while its agent stays alive, check on it and interrupt it if it is stuck. A session's model \
+         and reasoning effort are fixed when it is created and shown in its summary. devbox-mcp does not check \
+         them against a list of models, so an unsupported one is not ignored: the session's turns fail with the \
+         agent's own error saying what is wrong."
+    )
 }
