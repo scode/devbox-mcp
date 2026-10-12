@@ -48,8 +48,12 @@ struct Args {
 #[derive(Debug, clap::Subcommand)]
 enum Command {
     /// Set up this box to serve devbox-mcp through the OpenAI tunnel, as a systemd user service: writes the
-    /// tunnel-client profile, the runtime key (read from stdin), and the unit, then prints the commands that start it.
+    /// tunnel-client profile and the unit, then prints the commands that start it. Safe to rerun; it never touches the
+    /// runtime key.
     Setup(setup::SetupArgs),
+    /// Store the tunnel's runtime API key, read from stdin, for the service to use. Needed once per box, and again only
+    /// to replace the key.
+    SetKey(setup::SetKeyArgs),
 }
 
 /// The default working directory root, `~/devbox-mcp/work`.
@@ -80,8 +84,10 @@ const BLOCKING_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    if let Some(Command::Setup(setup_args)) = args.command {
-        return setup::run(setup_args);
+    match args.command {
+        Some(Command::Setup(setup_args)) => return setup::run(setup_args),
+        Some(Command::SetKey(set_key_args)) => return setup::set_key(set_key_args),
+        None => {}
     }
     let workdir_root = match args.workdir_root {
         Some(dir) => dir,

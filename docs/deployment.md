@@ -31,16 +31,24 @@ From a checkout of this repository:
   SHA-256. Then `install -m 755 target/tools/bin/tunnel-client ~/.local/bin/tunnel-client` copies it out of the build
   directory, so a `cargo clean` cannot break the service.
 
-## Run setup
+## Give it the runtime key
 
-Setup takes the tunnel ID as a flag and reads the runtime key from stdin, never from the command line, where other
-processes could see it. One way to type the key without it showing up in your shell history or process list (`printf` is
-a shell builtin, so it never becomes a process of its own):
+`devbox-mcp set-key` reads the runtime key from stdin, never from the command line, where other processes could see it,
+and writes it to `~/.config/devbox-mcp/tunnel.env`, which only you can read. One way to type the key without it showing
+up in your shell history or process list (`printf` is a shell builtin, so it never becomes a process of its own):
 
 ```
 read -rs key
-printf '%s\n' "$key" | ~/.local/bin/devbox-mcp setup --tunnel-id tunnel_...
+printf '%s\n' "$key" | ~/.local/bin/devbox-mcp set-key
 unset key
+```
+
+You need this once per box, and again only to replace the key; rerunning setup leaves the key alone.
+
+## Run setup
+
+```
+~/.local/bin/devbox-mcp setup --tunnel-id tunnel_...
 ```
 
 Run the installed `~/.local/bin/devbox-mcp`, not `cargo run`: setup tells tunnel-client to start the very binary that
@@ -48,13 +56,12 @@ ran setup. It finds Codex on your `PATH` (pass `--codex-bin` to pick another one
 `~/.local/bin/tunnel-client` (or `--tunnel-client`). Paths containing whitespace, quotes, backslashes, `%`, or `$` are
 refused rather than escaped.
 
-Setup writes three files and starts nothing:
+Setup writes two files and starts nothing:
 
 - `~/.config/tunnel-client/devbox.yaml`, the tunnel-client profile, written by `tunnel-client init`.
-- `~/.config/devbox-mcp/tunnel.env`, which holds the runtime key and is readable only by you.
-- `~/.config/systemd/user/devbox-mcp.service`, the unit.
+- `~/.config/systemd/user/devbox-mcp.service`, the unit, which loads the key file.
 
-Running setup again replaces all three, which is how you change the tunnel ID or the key.
+Running setup again replaces both, which is how you change the tunnel ID or the agents' `PATH`.
 
 ## Start the service
 
