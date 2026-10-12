@@ -177,6 +177,9 @@ impl Codex {
             .spawn()
             .with_context(|| format!("failed to start {}", self.bin.display()))?;
         let mut guard = process::TreeGuard::new(child.id());
+        let pid = child
+            .id()
+            .context("Codex exited before it could be tracked")?;
 
         let stderr = child.stderr.take().context("child stderr missing")?;
         let mut stderr_task = AbortOnDrop(tokio::spawn(read_bounded(stderr, MAX_STDERR_BYTES)));
@@ -191,18 +194,27 @@ impl Codex {
         let mut state = TurnState::default();
         let mut lines =
             BufReader::new(child.stdout.take().context("child stdout missing")?).lines();
-        let status = loop {
+        // Watch for Codex's exit without reaping it, so its PID and process group still belong to it while the guard
+        // cleans up below; reaping happens only afterwards.
+        let exited = process::exited(pid);
+        tokio::pin!(exited);
+        let exit_result = loop {
             tokio::select! {
                 line = lines.next_line() => match line.context("failed to read Codex output")? {
                     Some(line) => state.apply(&line)?,
                     // Codex closed stdout; it is about to exit, if it has not already.
-                    None => break child.wait().await.context("failed to wait for Codex")?,
+                    None => break (&mut exited).await,
                 },
-                status = child.wait() => break status.context("failed to wait for Codex")?,
+                result = &mut exited => break result,
             }
         };
-        // No `.await` between reaping the child (just above) and this call; see `TreeGuard::reaped`.
-        guard.reaped();
+        if let Err(err) = exit_result {
+            // Without a confirmed unreaped exit, the PID may no longer be Codex's, so it must not be signalled.
+            guard.disarm();
+            return Err(err).context("failed to wait for Codex");
+        }
+        guard.exited();
+        let status = child.wait().await.context("failed to reap Codex")?;
 
         // Codex has exited, so everything it wrote is already in the pipes. Read the rest, but only briefly: a
         // background process it started in another session may still hold the pipes open. Both pipes share one

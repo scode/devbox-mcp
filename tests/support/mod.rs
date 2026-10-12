@@ -27,6 +27,13 @@ use tempfile::TempDir;
 /// - `hang...`: never finishes. Like real Codex running a shell command, it first starts a shell in a new session (so
 ///   in another process group), and that shell starts a background `sleep`. A cleanup that only kills the agent's
 ///   process group misses both. PIDs go to `pids` (agent, session shell) and `detached` (the sleep).
+/// - `hang-resumers...`: never finishes. Starts a bash with job control that starts 50 `resumer` processes, each in
+///   its own process group in the same session, ignoring SIGHUP and starting a background `sleep` when continued.
+///   Killing a parent before its stopped children orphans their groups, and the kernel then continues them, so a
+///   cleanup in the wrong order lets new sleeps escape. PIDs go to `resumers` and, for anything that escaped,
+///   `spawned`.
+/// - `hang-nonutf8...`: never finishes. Starts, in a new session, a copy of `sleep` named `worker\xff`, whose
+///   `/proc/<pid>/stat` is not valid UTF-8. Its PID goes to `odd`.
 /// - `hiccup...`: an `error` event, then a normal completion.
 /// - `linger...`: completes normally, but first starts a background `sleep` in its own process group that keeps stdout
 ///   and stderr open after the agent exits. Its PID goes to `linger`.
@@ -54,6 +61,24 @@ case "$prompt" in
   fail*)
     echo '{"type":"turn.failed","error":{"message":"fake failure"}}'
     exit 1
+    ;;
+  hang-resumers*)
+    cat > "$dir/resumer" <<'EOS'
+#!/bin/bash
+trap '' HUP
+trap 'sleep 1000 & echo $! >> "$1/spawned"' CONT
+echo $$ >> "$1/resumers"
+while :; do sleep 0.05; done
+EOS
+    chmod +x "$dir/resumer"
+    bash -c 'set -m; for i in $(seq 1 50); do "$1/resumer" "$1" & done; wait' sh "$dir" &
+    wait
+    ;;
+  hang-nonutf8*)
+    name=$(printf 'worker\377')
+    cp "$(command -v sleep)" "$dir/$name"
+    setsid sh -c 'echo $$ > "$1.tmp" && mv "$1.tmp" "$1" && exec "$2" 1000' sh "$dir/odd" "$dir/$name" &
+    wait
     ;;
   hang*)
     setsid sh -c 'sleep 1000 & echo $! > "$1.tmp" && mv "$1.tmp" "$1"; wait' sh "$dir/detached" &
@@ -165,14 +190,17 @@ pub fn structured(result: &CallToolResult) -> &Value {
 /// Zombies count as gone: a killed process stays a zombie until its parent reaps it, and in a container whose init does
 /// not reap orphans that may be never, even though the process stopped running long ago.
 pub fn process_running(pid: i32) -> bool {
-    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+    let Ok(stat) = std::fs::read(format!("/proc/{pid}/stat")) else {
         return false;
     };
-    // The state follows the command name, which is in parentheses and may itself contain them.
+    // The state follows the command name, which is in parentheses, may itself contain them, and need not be UTF-8, so
+    // this works on bytes. An unparseable record counts as running: claiming a process is gone when it is not is the
+    // mistake these tests exist to catch.
     let state = stat
-        .rfind(')')
-        .and_then(|i| stat[i + 1..].split_whitespace().next());
-    state != Some("Z")
+        .iter()
+        .rposition(|&b| b == b')')
+        .and_then(|i| stat[i + 1..].iter().find(|b| !b.is_ascii_whitespace()));
+    state != Some(&b'Z')
 }
 
 /// Sends `signal` to `pid`, failing the test if that is impossible.

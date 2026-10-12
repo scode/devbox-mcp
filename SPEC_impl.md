@@ -52,10 +52,18 @@ Each turn is an agent child process started with an argument array, never a shel
 Killing that group is not enough: Codex runs every shell command in a new session, so a command's own children are in
 another process group (observed with codex-cli 0.162.1, where `bash -c "sleep 303 & sleep 120"` left both sleeps running
 after Codex was killed). A guard owned by the turn therefore kills the agent's whole process tree when the call is
-dropped. It walks `/proc` for every descendant, whatever its session or group, stopping each one so nothing can fork or
-escape while the walk runs, then kills them all. When the agent exits on its own, the turn ends at its exit rather than
-when its output pipes close, which a leftover background process could keep open forever; the guard then kills what is
-left in the agent's process group, and reading the pipes stops after a two-second grace period.
+dropped. It walks `/proc` one generation at a time, whatever each process's session or group, and stops each generation
+(confirming the stops took effect) before reading its children: a stopped process can neither fork nor reap, so the PIDs
+it walks cannot be reused under it. It then kills deepest first, because killing a parent before its stopped children
+can orphan their process groups, and the kernel continues the stopped members of a newly orphaned group. Both rules came
+from the second adversarial review, which showed processes escaping without them. `/proc/<pid>/stat` is parsed as bytes,
+since process names need not be UTF-8.
+
+When the agent exits on its own, the turn ends at its exit rather than when its output pipes close, which a leftover
+background process could keep open forever. The exit is noticed with `waitid(WNOWAIT)`, which leaves the agent unreaped,
+so its process group ID still belongs to it while the guard kills what is left in that group; only then is the agent
+reaped. Reading the pipes stops after a two-second grace period. (A pidfd would avoid the blocking thread `waitid`
+needs, but polling one asynchronously requires tokio's `net` feature, which also compiles in TCP listeners.)
 
 On Linux the child also gets a parent-death signal, so it is killed if devbox-mcp dies abruptly; it checks after setting
 the signal that devbox-mcp did not die in the meantime. The kernel ties that signal to the thread that spawned the

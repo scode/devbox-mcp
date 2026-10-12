@@ -256,15 +256,20 @@ impl RawServer {
     /// Initializes fully and starts a `hang` turn as request 2, returning the agent's PIDs (see
     /// `Harness::hanging_agent_pids`).
     async fn start_hanging_turn(&mut self, h: &Harness) -> Vec<i32> {
+        self.start_turn("hang").await;
+        h.hanging_agent_pids().await
+    }
+
+    /// Initializes fully and starts a turn with `prompt` as request 2, without waiting for anything.
+    async fn start_turn(&mut self, prompt: &str) {
         self.initialize().await;
         self.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
             .await;
         self.send(
             json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
-            "name": "run_turn", "arguments": {"prompt": "hang"}}}),
+            "name": "run_turn", "arguments": {"prompt": prompt}}}),
         )
         .await;
-        h.hanging_agent_pids().await
     }
 
     fn close_stdin(&mut self) {
@@ -361,4 +366,69 @@ async fn cancelling_a_call_kills_its_agent() {
     }
     server.close_stdin();
     server.assert_clean_exit().await;
+}
+
+/// Reads a file of whitespace-separated PIDs the fake agent wrote, or nothing if it does not exist.
+fn recorded_pids(h: &Harness, name: &str) -> Vec<i32> {
+    std::fs::read_to_string(h.fake_dir.join(name))
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(|p| p.parse().unwrap())
+        .collect()
+}
+
+/// Spec (`LIF-1`): cleanup must not let stopped processes resume and escape. If it killed a parent before its stopped
+/// children, the children's process groups would become orphaned and the kernel would continue them, and these
+/// fake processes start a new `sleep` whenever they are continued. Found by the second adversarial review, where 3 of
+/// 10 runs with killing in the wrong order leaked processes; the race is probabilistic, so a pass here is evidence,
+/// not proof.
+#[tokio::test]
+async fn cleanup_does_not_let_stopped_processes_resume() {
+    let h = Harness::new();
+    let mut server = RawServer::start(&h);
+    server.start_turn("hang-resumers").await;
+    assert!(
+        support::eventually(Duration::from_secs(10), || recorded_pids(&h, "resumers")
+            .len()
+            == 50)
+        .await,
+        "resumers never started"
+    );
+    let resumers = recorded_pids(&h, "resumers");
+
+    server.signal(libc::SIGTERM);
+    server.assert_clean_exit().await;
+    assert_all_gone(&resumers, "resumers survived devbox-mcp shutting down").await;
+    // Give any process continued during cleanup a moment to have spawned its escapee.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let spawned = recorded_pids(&h, "spawned");
+    let escaped: Vec<i32> = spawned
+        .iter()
+        .copied()
+        .filter(|&p| support::process_running(p))
+        .collect();
+    for &pid in &escaped {
+        send_signal(pid as u32, libc::SIGKILL);
+    }
+    assert!(escaped.is_empty(), "processes escaped cleanup: {escaped:?}");
+}
+
+/// Spec (`LIF-1`): a descendant whose command name is not valid UTF-8 is still found and killed. The name is chosen by
+/// the process (here, by the name of the executable), and `/proc/<pid>/stat` embeds it raw; a walk that drops records
+/// it cannot decode loses that process and everything below it. Found by the second adversarial review.
+#[tokio::test]
+async fn cleanup_finds_processes_with_non_utf8_names() {
+    let h = Harness::new();
+    let mut server = RawServer::start(&h);
+    server.start_turn("hang-nonutf8").await;
+    let odd_file = h.fake_dir.join("odd");
+    assert!(
+        support::eventually(Duration::from_secs(10), || odd_file.exists()).await,
+        "odd process never started"
+    );
+    let odd = recorded_pids(&h, "odd");
+
+    server.signal(libc::SIGTERM);
+    server.assert_clean_exit().await;
+    assert_all_gone(&odd, "non-UTF-8 named process survived").await;
 }
