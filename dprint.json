@@ -9,7 +9,8 @@
   "toml": {
   },
   "excludes": [
-    "**/*-lock.json"
+    "**/*-lock.json",
+    "lore/"
   ],
   "plugins": [
     "npm:@dprint/json@0.25.2@cefeda3078b93101a3ae1d46f70a69efaa3c2caa7a3107c6f7dad321fbd033e5",
