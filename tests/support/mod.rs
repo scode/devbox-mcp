@@ -46,6 +46,9 @@ use tempfile::TempDir;
 /// If a file named `noisy` exists next to the fake, it writes 256 KiB to stderr before reading its prompt, which
 /// deadlocks against a large prompt unless devbox-mcp drains output while still writing the prompt.
 ///
+/// While a file named `hold-start` exists next to the fake, it waits before reporting its thread, like a real agent
+/// that is slow to start, so tests can look at a turn whose conversation ID is not known yet.
+///
 /// Run as `delete --force <id>` (how devbox-mcp removes a session's data), it records its argv, one line per argument
 /// and a blank line after each call, in `delete-argv`, and behaves according to a file named `delete-mode` next to it:
 /// absent or `ok` succeeds, `fail` prints an error and exits 1 (as real Codex does for a session that is already gone),
@@ -70,6 +73,7 @@ fi
 prompt=$(cat)
 printf '%s' "$prompt" > "$dir/stdin"
 pwd > "$dir/cwd"
+while [ -f "$dir/hold-start" ]; do sleep 0.02; done
 # A resumed turn (`exec resume ... <id> -`) reports the session it was asked to resume, like real Codex.
 if [ "$2" = "resume" ]; then
   eval "thread=\${$(($# - 1))}"
@@ -369,4 +373,111 @@ pub fn hermetic_env(home: &std::path::Path) -> Vec<(String, std::ffi::OsString)>
         ),
         ("HOME".to_owned(), home.as_os_str().to_owned()),
     ]
+}
+
+/// Calls a tool and checks its structured result against the output schema the tool declares, returning the result.
+///
+/// Some MCP clients validate every result against the declared schema and reject a mismatch outright (Claude Code
+/// does), while rmcp's client here does not, so a result that disagrees with its own schema passes every other test and
+/// fails only with a real client. Panics on a tool error, a missing schema, or a mismatch.
+pub async fn call_checked(
+    client: &RunningService<RoleClient, ()>,
+    tool: &str,
+    args: Value,
+) -> Value {
+    let tools = client.list_all_tools().await.unwrap();
+    let schema = tools
+        .iter()
+        .find(|t| t.name == tool)
+        .and_then(|t| t.output_schema.clone())
+        .unwrap_or_else(|| panic!("{tool} declares no output schema"));
+    let schema = Value::Object((*schema).clone());
+    let result = structured(&call(client, tool, args).await.unwrap());
+    if let Some(mismatch) = schema_mismatch(&schema, &schema, &result, "result") {
+        panic!("{tool} result does not match its output schema: {mismatch}\nresult: {result}");
+    }
+    result
+}
+
+/// The first place where `value` breaks `schema`, or `None` if it matches.
+///
+/// Covers what schemars generates and what validating clients were seen to enforce: `type` (one name or a list),
+/// `required`, `properties`, `items`, `$ref` into the root's `$defs`, and `allOf`, `anyOf`, and `oneOf` (treated like
+/// `anyOf`). Anything else in the schema is ignored, so this is a check for the mistakes a derive can make, not a full
+/// JSON Schema validator.
+pub fn schema_mismatch(root: &Value, schema: &Value, value: &Value, path: &str) -> Option<String> {
+    let Value::Object(schema) = schema else {
+        return None;
+    };
+    if let Some(Value::String(reference)) = schema.get("$ref") {
+        let name = reference
+            .strip_prefix("#/$defs/")
+            .expect("only local $defs references");
+        if let Some(m) = schema_mismatch(root, &root["$defs"][name], value, path) {
+            return Some(m);
+        }
+    }
+    if let Some(Value::Array(all)) = schema.get("allOf") {
+        if let Some(m) = all
+            .iter()
+            .find_map(|s| schema_mismatch(root, s, value, path))
+        {
+            return Some(m);
+        }
+    }
+    for key in ["anyOf", "oneOf"] {
+        if let Some(Value::Array(any)) = schema.get(key)
+            && any
+                .iter()
+                .all(|s| schema_mismatch(root, s, value, path).is_some())
+        {
+            return Some(format!("{path} matches none of its {key} alternatives"));
+        }
+    }
+    if let Some(types) = schema.get("type") {
+        let names: Vec<&str> = match types {
+            Value::String(t) => vec![t.as_str()],
+            Value::Array(ts) => ts.iter().filter_map(Value::as_str).collect(),
+            _ => vec![],
+        };
+        let fits = |t: &str| match t {
+            "object" => value.is_object(),
+            "array" => value.is_array(),
+            "string" => value.is_string(),
+            "integer" => value.is_i64() || value.is_u64(),
+            "number" => value.is_number(),
+            "boolean" => value.is_boolean(),
+            "null" => value.is_null(),
+            _ => true,
+        };
+        if !names.iter().any(|t| fits(t)) {
+            return Some(format!("{path} is {value}, not of type {types}"));
+        }
+    }
+    if let Value::Object(fields) = value {
+        if let Some(Value::Array(required)) = schema.get("required") {
+            for name in required.iter().filter_map(Value::as_str) {
+                if !fields.contains_key(name) {
+                    return Some(format!("{path} lacks required property {name:?}"));
+                }
+            }
+        }
+        if let Some(Value::Object(properties)) = schema.get("properties") {
+            for (name, sub) in properties {
+                if let Some(field) = fields.get(name)
+                    && let Some(m) = schema_mismatch(root, sub, field, &format!("{path}.{name}"))
+                {
+                    return Some(m);
+                }
+            }
+        }
+    }
+    if let (Value::Array(items), Some(sub)) = (value, schema.get("items")) {
+        for (i, item) in items.iter().enumerate() {
+            if let Some(m) = schema_mismatch(root, sub, item, &format!("{path}[{i}]")) {
+                return Some(m);
+            }
+        }
+    }
+    None
 }
