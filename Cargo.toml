@@ -1,0 +1,9 @@
+[package]
+name = "devbox-mcp"
+version = "0.1.0"
+edition = "2024"
+description = "MCP server that lets agents interact with a remote Linux box"
+license = "Apache-2.0"
+repository = "https://github.com/scode/devbox-mcp"
+
+[dependencies]
