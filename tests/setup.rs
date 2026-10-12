@@ -57,7 +57,24 @@ impl Home {
     /// checks). Its environment is hermetic, so neither setup nor tunnel-client can see the developer's own
     /// configuration.
     async fn setup_with(&self, tunnel_id: &str, key: &str, home: &Path) -> Output {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_devbox-mcp"))
+        self.run_setup(tunnel_id, key, home, None).await
+    }
+
+    /// Runs setup in this home with `path` as the PATH of the shell it runs in.
+    async fn setup_with_path(&self, path: &str) -> Output {
+        self.run_setup(TUNNEL_ID, "key", self.path(), Some(path))
+            .await
+    }
+
+    async fn run_setup(
+        &self,
+        tunnel_id: &str,
+        key: &str,
+        home: &Path,
+        path: Option<&str>,
+    ) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_devbox-mcp"));
+        command
             .arg("setup")
             .arg("--tunnel-id")
             .arg(tunnel_id)
@@ -71,9 +88,11 @@ impl Home {
             .envs(hermetic_env(self.path()))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::piped());
+        if let Some(path) = path {
+            command.env("PATH", path);
+        }
+        let mut child = command.spawn().unwrap();
         let mut stdin = child.stdin.take().unwrap();
         stdin.write_all(key.as_bytes()).await.unwrap();
         drop(stdin);
@@ -168,6 +187,29 @@ async fn running_again_replaces_the_files() {
         "CONTROL_PLANE_API_KEY=second-key\n"
     );
     assert_eq!(home.mode("devbox-mcp/tunnel.env"), 0o600);
+}
+
+/// Spec (SPEC_impl.md "Deployment"): the service gets the PATH of the shell setup ran in, minus entries a unit cannot
+/// carry unescaped or a service must not depend on, so the agents' commands find the user's usual tools rather than
+/// only the systemd user manager's minimal PATH. Dropped entries are reported.
+#[tokio::test]
+async fn gives_the_service_the_shells_path() {
+    let home = Home::new();
+    let output = home
+        .setup_with_path("/opt/tools/bin:relative/bin:/has space/bin:/usr/bin:/bin")
+        .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let unit = home.config("systemd/user/devbox-mcp.service");
+    assert!(
+        unit.lines()
+            .any(|l| l == "Environment=PATH=/opt/tools/bin:/usr/bin:/bin"),
+        "{unit}"
+    );
+    let stderr = stderr(&output);
+    assert!(
+        stderr.contains("relative/bin") && stderr.contains("/has space/bin"),
+        "{stderr}"
+    );
 }
 
 /// Spec (SPEC_impl.md "Deployment"): the key goes into a fresh file, never through a symlink or hardlink left at the

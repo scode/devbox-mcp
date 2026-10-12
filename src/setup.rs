@@ -87,6 +87,14 @@ pub fn run(args: SetupArgs) -> anyhow::Result<()> {
         }
     }
 
+    let (path, skipped) = service_path(std::env::var_os("PATH").as_deref());
+    for entry in &skipped {
+        eprintln!(
+            "devbox-mcp setup: leaving {entry:?} out of the service's PATH (relative, or it would need escaping in the \
+             unit)"
+        );
+    }
+
     let key = read_key()?;
 
     let mcp_command = format!("{} --codex-bin {}", devbox_mcp.display(), codex.display());
@@ -119,11 +127,17 @@ pub fn run(args: SetupArgs) -> anyhow::Result<()> {
     fs::create_dir_all(&unit_dir)
         .with_context(|| format!("cannot create {}", unit_dir.display()))?;
     let unit = unit_dir.join(UNIT_NAME);
-    fs::write(&unit, unit_text(&tunnel_client, &profile_dir, &env_file))
-        .with_context(|| format!("cannot write {}", unit.display()))?;
+    fs::write(
+        &unit,
+        unit_text(&tunnel_client, &profile_dir, &env_file, path.as_deref()),
+    )
+    .with_context(|| format!("cannot write {}", unit.display()))?;
 
     println!(
         "Wrote the tunnel-client profile {PROFILE:?} in {}, the runtime key to {}, and {}.\n\
+         \n\
+         The agents' commands get this shell's PATH. To change it, run setup again from a shell with the PATH you \
+         want.\n\
          \n\
          To start the service, now and at every boot:\n\
          \n\
@@ -142,13 +156,19 @@ pub fn run(args: SetupArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The unit, from one fixed text with the paths filled in.
+/// The unit, from one fixed text with the paths and the PATH filled in.
 ///
 /// The health and admin listener goes on a Unix socket in a runtime directory only this user can enter: tunnel-client's
 /// admin API can start Codex with full access, so on its default loopback TCP port any local user could use it
 /// (SPEC.md `SEC-3`). `Restart=always` because tunnel-client exits with status 0 when devbox-mcp crashes. The rest is
 /// explained in SPEC_impl.md, "Deployment".
-fn unit_text(tunnel_client: &Path, profile_dir: &Path, env_file: &Path) -> String {
+fn unit_text(
+    tunnel_client: &Path,
+    profile_dir: &Path,
+    env_file: &Path,
+    path: Option<&str>,
+) -> String {
+    let environment = path.map_or(String::new(), |path| format!("Environment=PATH={path}\n"));
     format!(
         "\
 # Written by `devbox-mcp setup`; running it again replaces this file.
@@ -156,7 +176,7 @@ fn unit_text(tunnel_client: &Path, profile_dir: &Path, env_file: &Path) -> Strin
 Description=devbox-mcp, reached through the OpenAI tunnel
 
 [Service]
-EnvironmentFile={env_file}
+{environment}EnvironmentFile={env_file}
 ExecStart={tunnel_client} run --profile {PROFILE} --profile-dir {profile_dir} --health.unix-socket %t/devbox-mcp/tunnel-client.sock
 RuntimeDirectory=devbox-mcp
 RuntimeDirectoryMode=0700
@@ -183,16 +203,46 @@ fn plain_path(what: &str, path: &Path) -> anyhow::Result<()> {
     if !path.is_absolute() {
         bail!("the {what} path {text:?} must be absolute");
     }
-    if text
-        .chars()
-        .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '"' | '\'' | '\\' | '%' | '$'))
-    {
+    if needs_escaping(text) {
         bail!(
             "the {what} path {text:?} contains a character that would need escaping in a unit file (whitespace, a \
              quote, a backslash, '%', or '$'); use a path without one"
         );
     }
     Ok(())
+}
+
+/// Whether text would need escaping in a unit file or in tunnel-client's MCP command line: whitespace, quotes,
+/// backslashes, `%` (a systemd specifier), and `$` (systemd variable expansion).
+fn needs_escaping(text: &str) -> bool {
+    text.chars()
+        .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '"' | '\'' | '\\' | '%' | '$'))
+}
+
+/// The PATH the service runs with, taken from the PATH setup runs with, so that the agents' commands find the same
+/// tools as the user's own shell. Without it the service gets the systemd user manager's minimal PATH, which usually
+/// lacks directories such as `~/.local/bin` or `~/.cargo/bin`.
+///
+/// Entries that are relative or empty (both mean "the current directory", which a service must not depend on), not
+/// UTF-8, or that would need escaping in the unit are left out and returned separately, so setup can say so. Returns
+/// no PATH when nothing usable is left, in which case the unit sets none and the manager's default applies.
+fn service_path(path: Option<&std::ffi::OsStr>) -> (Option<String>, Vec<String>) {
+    let mut kept = Vec::new();
+    let mut skipped = Vec::new();
+    for entry in path.map(std::env::split_paths).into_iter().flatten() {
+        if entry.as_os_str().is_empty() {
+            // An empty entry, as in `a::b`, means the current directory too, but is too common to warn about.
+            continue;
+        }
+        match entry.to_str() {
+            Some(text) if entry.is_absolute() && !needs_escaping(text) => {
+                kept.push(text.to_owned())
+            }
+            _ => skipped.push(entry.to_string_lossy().into_owned()),
+        }
+    }
+    let path = (!kept.is_empty()).then(|| kept.join(":"));
+    (path, skipped)
 }
 
 /// Reads the runtime key from stdin: one line, of printable ASCII without spaces, quotes, or backslashes, so it can go
@@ -261,4 +311,26 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
         .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join(name))
         .find(|path| is_executable(path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The service's PATH keeps the user's absolute entries in order and drops what a unit cannot carry unescaped or a
+    /// service must not depend on, reporting all but empty entries.
+    #[test]
+    fn service_path_keeps_only_plain_absolute_entries() {
+        let (path, skipped) = service_path(Some("/a/bin::bin:/b c/bin:/d%/bin:/usr/bin".as_ref()));
+        assert_eq!(path.as_deref(), Some("/a/bin:/usr/bin"));
+        assert_eq!(skipped, ["bin", "/b c/bin", "/d%/bin"]);
+    }
+
+    /// With nothing usable, the unit sets no PATH at all rather than an empty one, which would leave the service unable
+    /// to find anything.
+    #[test]
+    fn service_path_is_none_without_usable_entries() {
+        assert_eq!(service_path(None), (None, vec![]));
+        assert_eq!(service_path(Some("rel:".as_ref())).0, None);
+    }
 }
