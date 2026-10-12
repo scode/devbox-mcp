@@ -8,36 +8,23 @@ mod support;
 use std::path::Path;
 use std::time::Duration;
 
-use rmcp::ServiceExt as _;
 use rmcp::model::CallToolRequestParams;
-use rmcp::service::{RoleClient, RunningService};
-use rmcp::transport::TokioChildProcess;
 use serde_json::{Value, json};
 use support::{
-    DEVBOX_MCP, Harness, assert_all_gone, hermetic_env, run_turn, send_signal, structured,
+    DEVBOX_MCP, Harness, assert_all_gone, connect, hermetic_env, run_turn, send_signal, structured,
 };
 use tokio::process::Command;
 
-/// Starts devbox-mcp on this harness and completes MCP initialization with it over stdio.
-async fn connect(h: &Harness) -> RunningService<RoleClient, ()> {
-    let mut cmd = Command::new(DEVBOX_MCP);
-    cmd.env_clear()
-        .envs(hermetic_env(h.tmp.path()))
-        .args(h.devbox_args());
-    ().serve(TokioChildProcess::new(cmd).unwrap())
-        .await
-        .unwrap()
-}
-
-/// Spec: the server advertises `run_turn`. This is the first thing any MCP client (and the tunnel's connector setup)
-/// sees, so a broken tool listing breaks everything downstream.
+/// Spec ("MCP tools"): the server advertises exactly the tools it implements. The tool list is the first thing any MCP
+/// client (and the tunnel's connector setup) sees, so a broken or surprising listing breaks everything downstream.
 #[tokio::test]
-async fn lists_run_turn_tool() {
+async fn lists_the_tools() {
     let h = Harness::new();
     let client = connect(&h).await;
     let tools = client.list_all_tools().await.unwrap();
-    let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
-    assert_eq!(names, ["run_turn"]);
+    let mut names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+    names.sort();
+    assert_eq!(names, ["run_turn", "session_create", "session_list"]);
     client.cancel().await.unwrap();
 }
 

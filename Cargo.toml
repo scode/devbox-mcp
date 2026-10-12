@@ -8,6 +8,7 @@ description = "MCP server that lets remote agents drive coding agents on a Linux
 
 [dependencies]
 anyhow = "1.0.104"
+chrono = { version = "0.4.45", default-features = false, features = ["std", "clock", "serde"] }
 clap = { version = "4.6.7", features = ["derive"] }
 libc = "0.2"
 # Server and stdio only. Never enable a feature that can listen for connections (SPEC.md SEC-2, SPEC_impl.md).

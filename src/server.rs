@@ -1,11 +1,12 @@
 //! The MCP tool surface devbox-mcp exposes over stdio.
 //!
-//! This is the primordial prototype surface: a single `run_turn` tool that runs one Codex turn to completion and
-//! returns its reply. It exists to prove the end-to-end path (MCP client -> devbox-mcp -> agent -> reply) and the
-//! testing flow around it. It deliberately does not yet follow SPEC.md's session and turn model; SPEC_impl.md's
-//! implementation status lists the gaps.
+//! The session tools of SPEC.md "MCP tools" are being added here one by one (`session_create`, `session_list` so far),
+//! next to the prototype's `run_turn`, which runs one Codex turn to completion and goes away once sessions can run
+//! turns. Each tool handler only translates between MCP and [`Sessions`]; the rules live there. SPEC_impl.md's
+//! implementation status lists what is still missing.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -15,13 +16,47 @@ use rmcp::{ErrorData as McpError, Json, ServerHandler, schemars, tool, tool_hand
 use serde::{Deserialize, Serialize};
 
 use crate::codex::{self, Codex, Progress, TurnRequest, TurnResult};
+use crate::sessions::{SessionError, SessionPage, SessionSummary, Sessions};
+use crate::store::Agent;
 
-/// Server-wide settings, fixed at startup from the command line.
-#[derive(Debug, Clone)]
+/// Server-wide settings and state, fixed at startup from the command line.
+#[derive(Clone)]
 pub struct Config {
-    /// Where turns run when the caller names no working directory. Must be absolute.
+    pub sessions: Arc<Sessions>,
+    /// Where the prototype's `run_turn` runs when the caller names no working directory. Must be absolute.
     pub workdir_root: PathBuf,
     pub codex: Codex,
+}
+
+impl From<SessionError> for McpError {
+    fn from(err: SessionError) -> Self {
+        match err {
+            SessionError::Invalid(message) => McpError::invalid_params(message, None),
+            SessionError::Internal(message) => McpError::internal_error(message, None),
+        }
+    }
+}
+
+// Arguments of `session_create`. Doc comments on schema types and their fields become JSON Schema descriptions, which
+// is text the calling model reads, so they are written for that model.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SessionCreateParams {
+    /// The new session's name: a lowercase letter, then lowercase letters, digits, `_`, or `-`; at most 64 characters.
+    /// You refer to the session by this name from then on.
+    pub name: String,
+    /// Absolute path of the directory the agent works in. It is created if missing; an existing directory is used as it
+    /// is, with whatever it already contains, and may be shared with other sessions. Omit it to use a directory named
+    /// after the session under devbox-mcp's default root (also reused if it already exists).
+    pub workdir: Option<String>,
+    /// The agent to run in this session. Only `codex` is available, and it is the default.
+    pub agent: Option<Agent>,
+}
+
+// Arguments of `session_list`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SessionListParams {
+    /// To get the next page, pass the `next_after` value of the previous page. Omit it for the first page.
+    pub after: Option<String>,
 }
 
 // Arguments of the `run_turn` tool. Doc comments on schema types and their fields become JSON Schema descriptions,
@@ -53,7 +88,7 @@ pub struct RunTurnResult {
 }
 
 /// The MCP server handler. Cheap to clone; rmcp clones it per request.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DevboxServer {
     config: Config,
     tool_router: ToolRouter<Self>,
@@ -66,6 +101,39 @@ impl DevboxServer {
             config,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Creates a session (SPEC.md `SES-1` to `SES-3`, `SES-7`).
+    #[tool(
+        description = "Create a new session: a long-lived conversation with a coding agent (Codex) that runs on this \
+                       Linux box with full access to it, working in one directory. Use it once per piece of work you \
+                       want to come back to; later messages to the same session keep the agent's context. Returns the \
+                       session. Fails if the name is invalid or already taken: an existing session with that name is \
+                       shown in the error, so if it is yours, keep using it instead of creating another."
+    )]
+    async fn session_create(
+        &self,
+        Parameters(params): Parameters<SessionCreateParams>,
+    ) -> Result<Json<SessionSummary>, McpError> {
+        Ok(Json(self.config.sessions.create(
+            &params.name,
+            params.workdir.as_deref(),
+            params.agent,
+        )?))
+    }
+
+    /// Lists sessions a page at a time (SPEC.md `SES-4`).
+    #[tool(
+        description = "List the sessions on this box, in name order, up to 50 per call, with each session's agent, \
+                       working directory, and its most recent turn (its state and, once it has ended, the start of the \
+                       agent's final message). Use it to find sessions you created earlier, for example after \
+                       reconnecting. When `next_after` is set, call again with `after` set to it for the next page."
+    )]
+    async fn session_list(
+        &self,
+        Parameters(params): Parameters<SessionListParams>,
+    ) -> Result<Json<SessionPage>, McpError> {
+        Ok(Json(self.config.sessions.list(params.after.as_deref())))
     }
 
     /// Runs a single Codex turn in a fresh session and waits for it to finish.

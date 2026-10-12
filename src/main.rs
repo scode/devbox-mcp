@@ -8,8 +8,11 @@ mod codex;
 mod events;
 mod process;
 mod server;
+mod sessions;
+mod store;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, bail};
@@ -29,6 +32,11 @@ struct Args {
     /// The Codex executable to run.
     #[arg(long, default_value = "codex")]
     codex_bin: PathBuf,
+
+    /// Directory for session records. Defaults to $XDG_STATE_HOME/devbox-mcp, or ~/.local/state/devbox-mcp. Must be
+    /// absolute. Only one devbox-mcp can use a state directory at a time.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
 }
 
 /// The default working directory root, `~/devbox-mcp/work`.
@@ -36,6 +44,18 @@ fn default_workdir_root() -> anyhow::Result<PathBuf> {
     let home =
         std::env::home_dir().context("cannot determine home directory; pass --workdir-root")?;
     Ok(home.join("devbox-mcp").join("work"))
+}
+
+/// The default state directory: `$XDG_STATE_HOME/devbox-mcp` when that variable holds an absolute path (the XDG base
+/// directory rule), otherwise `~/.local/state/devbox-mcp`.
+fn default_state_dir() -> anyhow::Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("XDG_STATE_HOME").map(PathBuf::from)
+        && dir.is_absolute()
+    {
+        return Ok(dir.join("devbox-mcp"));
+    }
+    let home = std::env::home_dir().context("cannot determine home directory; pass --state-dir")?;
+    Ok(home.join(".local").join("state").join("devbox-mcp"))
 }
 
 /// How long shutdown waits for the runtime's blocking threads after in-flight work has been dropped.
@@ -57,7 +77,23 @@ fn main() -> anyhow::Result<()> {
             workdir_root.display()
         );
     }
+    let state_dir = match args.state_dir {
+        Some(dir) => dir,
+        None => default_state_dir()?,
+    };
+    if !state_dir.is_absolute() {
+        bail!("--state-dir must be absolute, got {}", state_dir.display());
+    }
+    // Opened before the runtime starts: taking the lock may wait for a previous devbox-mcp to exit, and blocking is
+    // fine here.
+    let store = store::Store::open(&state_dir)?;
     let config = server::Config {
+        sessions: Arc::new(sessions::Sessions::new(
+            store,
+            sessions::Config {
+                workdir_root: workdir_root.clone(),
+            },
+        )?),
         workdir_root,
         codex: codex::Codex {
             bin: args.codex_bin,

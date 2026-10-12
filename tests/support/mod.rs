@@ -112,6 +112,8 @@ pub struct Harness {
     pub tmp: TempDir,
     pub fake_dir: PathBuf,
     pub workdir_root: PathBuf,
+    /// devbox-mcp's state directory (session records and its lock).
+    pub state_dir: PathBuf,
 }
 
 impl Harness {
@@ -123,10 +125,12 @@ impl Harness {
         std::fs::write(&fake, FAKE_CODEX).unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         let workdir_root = tmp.path().join("work");
+        let state_dir = tmp.path().join("state");
         Self {
             tmp,
             fake_dir,
             workdir_root,
+            state_dir,
         }
     }
 
@@ -137,6 +141,8 @@ impl Harness {
             self.workdir_root.to_str().unwrap().to_owned(),
             "--codex-bin".to_owned(),
             self.fake_dir.join("codex").to_str().unwrap().to_owned(),
+            "--state-dir".to_owned(),
+            self.state_dir.to_str().unwrap().to_owned(),
         ]
     }
 
@@ -168,6 +174,29 @@ impl Harness {
         assert!(pids.iter().all(|&p| process_running(p)));
         pids
     }
+}
+
+/// Starts devbox-mcp on this harness and completes MCP initialization with it over stdio.
+pub async fn connect(h: &Harness) -> RunningService<RoleClient, ()> {
+    use rmcp::ServiceExt as _;
+    let mut cmd = tokio::process::Command::new(DEVBOX_MCP);
+    cmd.env_clear()
+        .envs(hermetic_env(h.tmp.path()))
+        .args(h.devbox_args());
+    ().serve(rmcp::transport::TokioChildProcess::new(cmd).unwrap())
+        .await
+        .unwrap()
+}
+
+/// Calls any tool with JSON arguments, returning the protocol-level result so tests can check errors too.
+pub async fn call(
+    client: &RunningService<RoleClient, ()>,
+    tool: &str,
+    args: Value,
+) -> Result<CallToolResult, rmcp::ServiceError> {
+    let params = CallToolRequestParams::new(tool.to_owned())
+        .with_arguments(args.as_object().unwrap().clone());
+    client.call_tool(params).await
 }
 
 /// Calls `run_turn` with the given JSON arguments, failing the test on a protocol-level error.

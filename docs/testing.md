@@ -57,8 +57,9 @@ quickest way for a person or a coding agent to check behavior against the real C
 
 ```
 cargo build
+scratch="$(mktemp -d)"
 cargo run --example mcp-call -- --list \
-    --server-arg=--workdir-root="$(mktemp -d)" \
+    --server-arg=--workdir-root="$scratch/work" --server-arg=--state-dir="$scratch/state" \
     run_turn '{"prompt": "Say hello world and nothing else."}'
 ```
 
@@ -70,10 +71,11 @@ mode hides both effects. In tunnel mode, tunnel-client (and so devbox-mcp and th
 of your environment, enough for the agent to find its tools and its login, so your own tunnel-client configuration
 cannot leak in; see `AGENT_ENV_ALLOWLIST` in the driver if an agent needs more.
 
-Always pass `--workdir-root` pointing at a scratch directory, so manual turns do not run in the default
-`~/devbox-mcp/work`. Several `TOOL JSON` pairs on one command line run in order against the same server process; use
-that whenever a later call depends on state from an earlier one, because each invocation of the driver starts a fresh
-server.
+Always pass `--workdir-root` and `--state-dir` pointing into a scratch directory, so manual runs neither work in the
+default `~/devbox-mcp/work` nor touch the default state directory, which a deployed devbox-mcp uses (and holds a lock
+on, so a manual run against it would wait and then fail). Several `TOOL JSON` pairs on one command line run in order
+against the same server process; use that whenever a later call depends on state from an earlier one, because each
+invocation of the driver starts a fresh server.
 
 Expect a `run_turn` result with `"completed": true`, a `reply` from the agent, and Codex's `agent_session_id`. A hello
 world turn took about 10 seconds when this was written, in either mode.
@@ -88,7 +90,8 @@ Claude Code in print mode can load devbox-mcp as an MCP server for one session:
 cargo build
 bin="$PWD/target/debug/devbox-mcp"
 work="$(mktemp -d)"
-cfg="$(printf '{"mcpServers":{"devbox":{"command":"%s","args":["--workdir-root","%s"]}}}' "$bin" "$work")"
+cfg="$(printf '{"mcpServers":{"devbox":{"command":"%s","args":["--workdir-root","%s/work","--state-dir","%s/state"]}}}' \
+    "$bin" "$work" "$work")"
 (cd "$work" && claude -p --mcp-config "$cfg" --strict-mcp-config \
     --tools '' --allowedTools mcp__devbox__run_turn -- \
     "Use the devbox run_turn tool to ask the remote agent to say hello world. \
