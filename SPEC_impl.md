@@ -6,7 +6,16 @@ agreement.
 
 ## Implementation status
 
-Nothing in SPEC.md is implemented yet. The binary is a placeholder that does not speak MCP.
+The code is a primordial prototype whose job is to prove the end-to-end path (MCP client, devbox-mcp, agent, reply) and
+the testing flow around it. It exposes a single tool, `run_turn`, which runs one Codex turn in a fresh session and
+blocks until the turn ends, returning the agent's final message. Implemented so far: the stdio transport and the
+security posture (`SEC-*`, `TSP-1`), a first Codex adapter, and `LIF-1` for orderly shutdowns.
+
+Not yet implemented, and contradicted by the prototype until it is: sessions (`SES-*`), turns that run in the background
+and are read incrementally (`TRN-*`; `run_turn` blocks instead), transcripts (`TRA-*`), model and effort selection
+(`SES-7`), and response bounds (`BND-1`; `run_turn` returns the whole reply and blocks for as long as the turn takes).
+`run_turn` goes away once sessions exist. Of the configuration flags below, only `--workdir-root` and `--codex-bin`
+exist so far, and `--workdir-root` is currently used directly as the default working directory.
 
 ## Language and dependencies
 
@@ -22,13 +31,20 @@ There is one process: the stdio MCP server that `tunnel-client` starts through i
 one long-lived child per tunnel and pipes every MCP request through it; it replaces the child when tunnel-client itself
 restarts, when the pipes fail, and on some timeout paths, and the new child has to be initialized again. (This was read
 from tunnel-client's source at commit `b91e6c9`, 2026-10-09; recheck it on upgrades.) There is no separate supervisor
-and no IPC, because running turns are not required to survive the process (`LIF-1`).
+and no IPC, because running turns are not required to survive the process (`LIF-1`). Conversely, when the child exits on
+its own, tunnel-client asks for its own shutdown, so a crashing devbox-mcp takes tunnel-client down with it.
 
-Each turn is an agent child process started with an argument array, never a shell string. On Linux the child is started
-in its own process group with a parent-death signal set, so it is killed if devbox-mcp dies, and devbox-mcp kills the
-whole process group on orderly shutdown and on interrupt. Known gap: if devbox-mcp is killed abruptly, the parent-death
-signal reaches only the agent process itself, and commands the agent started may outlive it. Closing that gap (with a
-subreaper or a cgroup) is future work.
+tunnel-client stops its child by closing the child's stdin and sending it SIGTERM. devbox-mcp therefore treats stdin
+reaching end of file, SIGTERM, and SIGINT alike as a request for an orderly shutdown: it returns from `main`, which
+drops the tokio runtime and with it every in-flight tool call, and dropping a call kills its agent.
+
+Each turn is an agent child process started with an argument array, never a shell string. The child is started in its
+own process group, and a guard owned by the turn kills that whole group (so also any commands the agent started) when
+the turn ends or its call is dropped. On Linux the child also gets a parent-death signal, so it is killed if devbox-mcp
+dies abruptly. The kernel ties that signal to the thread that spawned the child, not the process, which is why
+devbox-mcp runs a current-thread tokio runtime: every child is spawned from the main thread. Known gap: on an abrupt
+death of devbox-mcp (SIGKILL, a crash), the parent-death signal reaches only the agent process itself, and commands the
+agent started may outlive it. Closing that gap (with a subreaper or a cgroup) is future work.
 
 ## Configuration
 
@@ -82,5 +98,6 @@ turns.
 
 ## Testing
 
-Automated tests use only injected paths and fake agents, never the user's real state or a real model. Running real
-agents is a manual step. How both work will be documented once the first working version exists.
+Automated tests use only injected paths and fake agents, never the user's real state or a real model, and drive the real
+binary over stdio. Running real agents is a manual step, with a driver for direct tool calls and a recipe for putting a
+real model in front of devbox-mcp. [docs/testing.md](docs/testing.md) describes all of it.

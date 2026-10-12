@@ -1,15 +1,20 @@
 # devbox-mcp
 
-NOTE: This does not do anything useful yet. The crate is a hello-world placeholder while the repository scaffolding is
-set up.
+NOTE: This is an early prototype. It can run a single Codex turn on the box and return the reply, and nothing more yet.
 
-devbox-mcp is going to be an [MCP](https://modelcontextprotocol.io/) server that lets agents, such as ChatGPT, interact
-with a remote Linux box.
+devbox-mcp is going to be an [MCP](https://modelcontextprotocol.io/) server that lets remote agents, such as ChatGPT
+Dots, drive coding agents (Codex, and later others) on a Linux box, through the OpenAI Secure MCP Tunnel.
+
+WARNING: Giving an agent access to devbox-mcp is the equivalent of giving it an SSH key to the box. Agents it launches
+run with full access and no permission prompts. See the security model in [SPEC.md](SPEC.md).
 
 ## Building
 
 - `cargo build` to build.
-- `cargo run` to run.
+- `cargo test` to run the automated tests.
+
+[SPEC.md](SPEC.md) describes what devbox-mcp is meant to do, [SPEC_impl.md](SPEC_impl.md) how it is built and how far
+along it is, and [docs/testing.md](docs/testing.md) how to test it, including against real agents.
 
 ## License
 

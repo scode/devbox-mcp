@@ -24,6 +24,15 @@ Run the same checks CI runs, with the same arguments, and make sure they all pas
 - `cargo test`
 - `dprint check`
 
+## Testing against real agents
+
+CI only runs the hermetic tests. [docs/testing.md](docs/testing.md) describes the manual layers on top: a driver that
+calls devbox-mcp's tools directly, and a recipe for putting a real model in front of it as the MCP client. When a change
+affects what devbox-mcp does with a real agent or how a client sees its tools, run the relevant manual layer before
+calling the work done, and say in your report which layers you ran. They run real agents with full access to the machine
+and cost model usage, so use harmless prompts and a scratch `--workdir-root`. Never perform the real-tunnel steps
+(credentials, tunnel registration, services) yourself; those are the user's.
+
 ## Conventional Commits
 
 All commit messages and PR titles must use Conventional Commit format: `<type>: <short summary>`
