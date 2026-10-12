@@ -11,7 +11,8 @@ the security posture (`SEC-*`, `TSP-1`), `LIF-1` for orderly shutdowns, sessions
 adapter, the session store of "Storage", and turns (`TRN-*`) with "Turn lifecycle", "Turn events", cursors, request IDs,
 liveness, and the bounds of `BND-*`, through the five session tools.
 
-Not yet implemented: transcripts (`TRA-*`) and session removal (`SES-1`, `SES-6`). "Deployment" is implemented by
+Not yet implemented: transcripts (`TRA-*`), session removal (`SES-1`, `SES-6`), and choosing a session's model and
+effort (`SES-7`); the last two are specified below for step 2 of the roadmap in TODO.md. "Deployment" is implemented by
 `devbox-mcp setup`; [docs/deployment.md](docs/deployment.md) is the guide.
 
 ## Language and dependencies
@@ -108,6 +109,15 @@ interleave and no further coordination is needed. A send is accepted only once i
 the send fails and nothing runs. If a later write fails, the call or turn that made it reports the error, memory keeps
 the correct state, and the next successful write of that session brings the file up to date.
 
+Removing a session deletes its record file after the agent's own data is gone, so a crash in between leaves a record
+whose agent data no longer exists. Removing it again then fails, since the agent's delete command cannot tell "already
+gone" from a failure, and the caller forces the removal; a send to it in the meantime fails the way a resume of a
+missing conversation fails.
+
+A record also says whether an earlier conversation of the session was never tracked. That is set when a send starts a
+fresh conversation because the previous one could not be resumed (`context_reset`, `SES-5`): the agent may have stored
+that earlier conversation, but devbox-mcp never learned its ID, so it cannot delete it, and removal requires `force`.
+
 Records are read at startup. A most recent turn still recorded as `running` or `interrupting` is reported as `lost`
 (`TRN-5`); the file itself is updated with the session's next write. A record that cannot be parsed is left untouched, a
 warning naming it goes to stderr, it is left out of `session_list`, and creating a session with that name fails with an
@@ -128,13 +138,16 @@ durable record of what happened is the agent's own transcript (`TRA-2`).
 The tools named in SPEC.md, as they are implemented. Argument and result fields are JSON; every result is returned both
 as MCP structured content and, for clients that ignore that, as the same JSON as text.
 
-- `session_create { name, workdir?, agent? }`: `workdir` defaults to `<workdir-root>/<name>` and must be absolute. It is
-  created with its parents if missing; if it exists it must be a directory (symlinks are followed). The session exists
-  once its record is on disk; a directory created before a failure is left in place. `agent` must be `codex`. Returns a
-  session summary. On a name collision, the error message includes the existing session's summary.
+- `session_create { name, workdir?, agent?, model?, effort? }`: `workdir` defaults to `<workdir-root>/<name>` and must
+  be absolute. It is created with its parents if missing; if it exists it must be a directory (symlinks are followed).
+  The session exists once its record is on disk; a directory created before a failure is left in place. `agent` must be
+  `codex`. `model` is 1 to 128 characters from `A-Z a-z 0-9 . _ : / -`, and `effort` 1 to 32 characters from `a-z 0-9
+  _ -`; that check is only about what can be passed to the agent safely (the effort goes into a TOML override), not
+  about what the agent supports. Returns a session summary. On a name collision, the error message includes the existing
+  session's summary.
 - `session_list { after? }`: returns `{ sessions: [summary], next_after? }`: at most 50 sessions in name order, starting
-  after the name `after`; `next_after` is present when more follow. A summary is `{ name, agent, workdir, turn }`, where
-  `turn` is the most recent turn as `{ id, state, started_at, ended_at?, final_message_preview?,
+  after the name `after`; `next_after` is present when more follow. A summary is `{ name, agent, model, effort, workdir,
+  turn }`, where `turn` is the most recent turn as `{ id, state, started_at, ended_at?, final_message_preview?,
   final_message_truncated?, error? }` with a preview of at most 2 KiB, or null before the first turn.
 - `session_send { name, message, request_id? }`: `message` is at most 256 KiB; `request_id` is 1 to 128 characters from
   `A-Z a-z 0-9 . _ : -`. Checked in this order: unknown session, then a known request ID (same message: return the
@@ -154,10 +167,28 @@ as MCP structured content and, for clients that ignore that, as the same JSON as
   `turn_duration_seconds` is the time since it started, for an ended one the time it ran. Times are RFC 3339 timestamps
   in UTC; durations are whole seconds.
 - `session_interrupt { name }`: returns the most recent turn as in a summary, normally with state `interrupting`.
+- `session_remove { name, force? }`: returns `{ session, agent_data_deleted }`, where `session` is the summary as it was
+  just before removal. Fails if the session does not exist or its most recent turn is `running` or `interrupting`.
+  Without `force`, it also fails when deleting the agent's data fails, and when deletion cannot be confirmed: the
+  session has had a turn but its native session ID was never learned, or its record says an earlier conversation was
+  never tracked (see "Storage"). With `force`, those cases forget the session anyway, with `agent_data_deleted: false`.
+  Removal deletes the agent's data first and the record second. The session stays in memory until its record is gone, so
+  a failure at any point leaves it listed; the error says that the agent may already have deleted part of its data,
+  which then stays deleted, and a later send fails the way a resume of a missing conversation fails. Failure output from
+  the agent's delete command is cut to 2 KiB.
+- While the agent's data is being deleted, the session is marked as being removed, in memory only. New sends and other
+  removals fail as busy; a send that repeats a known request ID is still replayed first, as above. The mark is set in
+  the same step as the busy check and cleared once the deletion has finished or failed.
+- Removal is by name only. Two callers acting on the same name at once (one removing, another recreating) are not
+  guarded against: a retried removal whose first response was lost can remove a session another caller has just created
+  under the same name. Multiple independent callers are a non-goal (SPEC.md).
 
 Cursors are opaque strings that encode the session name, an ID of the devbox-mcp process that issued them (random at
-startup), and the sequence number of the last event the caller has seen (0 for "before the first event"). Event sequence
-numbers count up from 1 within a session and process, across turns. Reads have two outcomes for a cursor:
+startup) together with the session's incarnation in that process (a number each session gets when it is loaded or
+created, counting up across the process), and the sequence number of the last event the caller has seen (0 for "before
+the first event"). Event sequence numbers count up from 1 within a session and process, across turns. The incarnation
+means a cursor from a removed session is not mistaken for one of a new session created under the same name: it is
+treated like a cursor from another process. Reads have two outcomes for a cursor:
 
 - one that cannot be parsed, or that belongs to another session, is an error naming the problem;
 - one that cannot otherwise be honored (from another process, older than the oldest event still held, or beyond the
@@ -175,8 +206,11 @@ agent output are read whole; the agent is trusted under the security model, so a
 nothing more.
 
 No call waits on an agent or on a background task (`BND-2`): each one reads or updates in-memory state and, at most,
-writes one session record. There is no fixed time limit beyond that; a call that cannot make progress because the disk
-is stuck is a failure of the box, not something devbox-mcp can bound.
+writes one session record. The one exception is `session_remove`, which waits for the agent's delete command (see the
+Codex adapter): a short bookkeeping command, not an agent making progress, bounded by a 10 second timeout. While it
+runs, tunnel-client delivers no other call, which is the price of a removal that either finishes or fails before it
+returns. There is no fixed time limit beyond that; a call that cannot make progress because the disk is stuck is a
+failure of the box, not something devbox-mcp can bound.
 
 ## Turn lifecycle
 
@@ -276,7 +310,7 @@ touching the session logic. An agent's module knows how to:
 - build the command line for a first turn and for a resumed turn, with permissions fully disabled (`SEC-4`);
 - turn the agent's output stream into devbox-mcp's turn events, and extract the agent's native session ID;
 - locate and read the agent's native transcript for a session (step 4 in TODO.md);
-- delete the agent's stored data for a session (`SES-6`, step 2).
+- delete the agent's stored data for a session (`SES-6`).
 
 With only Codex so far, the boundary is simply `codex.rs`'s functions: no trait, no dynamic dispatch, and nothing for
 the later steps until they are built. The shape of a shared interface is decided when the second agent arrives (step 3),
@@ -297,7 +331,16 @@ The Codex adapter uses non-interactive mode, checked against codex-cli 0.162.1:
   `--last`, which picks whatever session ran most recently.
 - `--skip-git-repo-check` is needed because Codex otherwise refuses to run outside a git repository, and session working
   directories need not be repositories.
-- Defaults: model `gpt-6.1-sol`, reasoning effort `high`.
+- Defaults: model `gpt-6.1-sol`, reasoning effort `high`. Which efforts a model supports varies by model; an unsupported
+  one fails the turn with an error from the model API that names the valid values, which is what the caller sees as the
+  turn's failure reason.
+- Removing a session's data: `codex delete --force <native session ID>`, run with the same environment as the turns, so
+  it uses the same Codex home. It deletes the rollout file and Codex's database rows for the session (checked with
+  0.162.1). On a timeout of 10 seconds the command is killed and reaped before the removal fails, so it can never delete
+  anything after the session is back in use. Any failure is a failure of the removal: Codex reports an already deleted
+  session with the same message and exit status as a real failure, and a failure can come after part of the data is
+  already deleted (the rollout before the database rows), so devbox-mcp does not try to tell these apart and leaves the
+  decision to the caller's `force`.
 - The native transcript is a rollout file under Codex's home directory (`$CODEX_HOME`, by default `~/.codex`), at
   `sessions/YYYY/MM/DD/rollout-<timestamp>-<session id>.jsonl`. Codex compresses old rollouts to `.jsonl.zst` and
   removes the plain file, so reading or deleting a session's native data (steps 2 and 4 in TODO.md) must handle both.

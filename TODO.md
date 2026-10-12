@@ -30,7 +30,7 @@ tunnel for any turn longer than the tunnel's response deadline.
 
 What step 1 leaves out of a session's life, so that sessions can be used for real work over days.
 
-- [ ] Spec. Removing sessions, including the agent's own data (`SES-6`), and choosing model and effort per session
+- [x] Spec. Removing sessions, including the agent's own data (`SES-6`), and choosing model and effort per session
       (`SES-7`). (Default working directories and reporting turns lost to a restart moved into step 1.)
 - [ ] Plan and implement.
 

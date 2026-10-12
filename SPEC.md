@@ -74,9 +74,16 @@ a string of one-off invocations that each lose their context.
   reported how to resume it), it MUST say so when the caller next sends to the session, not silently start a fresh
   conversation under the same session.
 - `SES-6`: Removing a session MUST forget it in devbox-mcp and delete the agent's own stored data for that session.
-  Removing a session MUST NOT delete or modify its working directory.
+  Removing a session MUST NOT delete or modify its working directory. A session with a turn in progress cannot be
+  removed; the caller interrupts the turn first. If the agent's data cannot be deleted, or devbox-mcp cannot confirm
+  that it was (for instance because the agent reports a failure, or because an earlier conversation of the session was
+  never tracked), the session MUST NOT be removed unless the caller explicitly forces it, so that nothing is left behind
+  that devbox-mcp no longer knows about without the caller having said so. A forced removal forgets the session and
+  tells the caller that the agent's data may remain. Once removed, the session's name is free for a new session.
 - `SES-7`: The caller MUST be able to choose the agent when creating a session, and MAY choose the model and reasoning
-  effort. When not chosen, each agent has a documented default.
+  effort. When not chosen, each agent has a documented default. The choice is fixed for the session's life, and the
+  session shows it. devbox-mcp does not keep its own list of valid models or efforts: a choice the agent rejects makes
+  the session's turns fail with the agent's own explanation.
 - `SES-8`: The most recent turn's outcome MUST survive restarts of devbox-mcp along with the session: its state, the
   agent's final message, and, if it failed, why. A caller coming back later can then see how the last turn ended. Older
   turns' outcomes and the full event history of any turn need not survive; the agent's own transcript is the durable
@@ -162,15 +169,15 @@ in devbox-mcp, not in the agent.
 ## MCP tools
 
 The tools devbox-mcp exposes, and what each one promises. SPEC_impl.md gives their exact schemas and limits. Tools for
-the requirements not yet covered here (removing sessions, reading transcripts) will be added with them.
+the requirements not yet covered here (reading transcripts) will be added with them.
 
-- `session_create`: creates a session (`SES-1`). Takes a `name` (`SES-2`), an optional absolute `workdir` (`SES-3`), and
-  an optional `agent` (`SES-7`; `codex`, the only agent so far, by default). Returns the new session as `session_list`
-  would show it. Fails if the name is invalid or already taken (the error then shows the existing session, so a caller
-  retrying a create whose response was lost can tell whether it is its own), or if the working directory cannot be
-  created or is not a directory.
-- `session_list`: lists sessions (`SES-4`) a page at a time, in name order, each with its name, agent, working
-  directory, and the state of its most recent turn, including that turn's outcome once it has ended (`SES-8`).
+- `session_create`: creates a session (`SES-1`). Takes a `name` (`SES-2`), an optional absolute `workdir` (`SES-3`), an
+  optional `agent` (`SES-7`; `codex`, the only agent so far, by default), and an optional `model` and `effort`
+  (`SES-7`). Returns the new session as `session_list` would show it. Fails if the name is invalid or already taken (the
+  error then shows the existing session, so a caller retrying a create whose response was lost can tell whether it is
+  its own), or if the working directory cannot be created or is not a directory.
+- `session_list`: lists sessions (`SES-4`) a page at a time, in name order, each with its name, agent, model and effort,
+  working directory, and the state of its most recent turn, including that turn's outcome once it has ended (`SES-8`).
 - `session_send`: sends a message to a session, starting a turn (`TRN-1`), with an optional request ID (`TRN-6`).
   Returns the turn's ID, whether this was a retry of an earlier send, and a cursor from which `session_read` returns
   that turn's events if they are still held. Fails if the session does not exist, is busy (`TRN-2`), or the request ID
@@ -182,6 +189,10 @@ the requirements not yet covered here (removing sessions, reading transcripts) w
 - `session_interrupt`: starts interrupting a session's running turn (`TRN-4`) and returns immediately with the turn's
   state, which stays "being interrupted" until the agent's processes are gone; the caller follows it with
   `session_read`. If no turn is running, it changes nothing and returns the state of the most recent turn.
+- `session_remove`: removes a session (`SES-6`) and returns it as `session_list` showed it last, with whether the
+  agent's data was deleted. Takes an optional `force`. Fails if the session does not exist or has a turn in progress,
+  and, unless forced, if the agent's data could not be deleted or its deletion cannot be confirmed. A failed removal
+  keeps the session, though the agent may already have deleted part of its data before failing.
 
 ## Non-goals
 
