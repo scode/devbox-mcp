@@ -82,8 +82,10 @@ a string of one-off invocations that each lose their context.
   tells the caller that the agent's data may remain. Once removed, the session's name is free for a new session.
 - `SES-7`: The caller MUST be able to choose the agent when creating a session, and MAY choose the model and reasoning
   effort. When not chosen, each agent has a documented default. The choice is fixed for the session's life, and the
-  session shows it. devbox-mcp does not keep its own list of valid models or efforts: a choice the agent rejects makes
-  the session's turns fail with the agent's own explanation.
+  session shows it. An unsupported model or effort MUST NOT be silently ignored. Depending on the agent and the value,
+  it is either rejected when the session is created or makes the session's turns fail with the agent's own explanation;
+  the tool descriptions MUST say this, and that a creation that succeeds does not mean the agent supports the choice, so
+  that a caller does not conclude from one case how every agent and value behaves.
 - `SES-8`: The most recent turn's outcome MUST survive restarts of devbox-mcp along with the session: its state, the
   agent's final message, and, if it failed, why. A caller coming back later can then see how the last turn ended. Older
   turns' outcomes and the full event history of any turn need not survive; the agent's own transcript is the durable
@@ -129,7 +131,9 @@ the next message.
   work in that session (for instance, to analyze its transcript) simply by sending it another message.
 - `TRA-2`: The caller MUST be able to read ranges of a session's transcript directly, without going through the agent,
   so it can see the details for itself. The transcript SHOULD be as close to the agent's own record as practical rather
-  than a lossy summary of it.
+  than a lossy summary of it. Reading the end of a transcript MUST NOT require knowing its length, since what happened
+  last is what a caller most often wants. When the transcript cannot be found or read, the caller MUST be told so, not
+  given an empty transcript.
 
 ## Lifetime and honest reporting
 
@@ -168,14 +172,14 @@ in devbox-mcp, not in the agent.
 
 ## MCP tools
 
-The tools devbox-mcp exposes, and what each one promises. SPEC_impl.md gives their exact schemas and limits. Tools for
-the requirements not yet covered here (reading transcripts) will be added with them.
+The tools devbox-mcp exposes, and what each one promises. SPEC_impl.md gives their exact schemas and limits.
 
 - `session_create`: creates a session (`SES-1`). Takes a `name` (`SES-2`), an optional absolute `workdir` (`SES-3`), an
-  optional `agent` (`SES-7`; `codex`, the only agent so far, by default), and an optional `model` and `effort`
-  (`SES-7`). Returns the new session as `session_list` would show it. Fails if the name is invalid or already taken (the
-  error then shows the existing session, so a caller retrying a create whose response was lost can tell whether it is
-  its own), or if the working directory cannot be created or is not a directory.
+  optional `agent` (`SES-7`; `codex`, the default, or `claude`), and an optional `model` and `effort` (`SES-7`). Returns
+  the new session as `session_list` would show it. Fails if the name is invalid or already taken (the error then shows
+  the existing session, so a caller retrying a create whose response was lost can tell whether it is its own), or if the
+  working directory cannot be created or is not a directory. Depending on the agent, it may also reject an unsupported
+  model or effort; when it does not, the session's turns fail instead (`SES-7`).
 - `session_list`: lists sessions (`SES-4`) a page at a time, in name order, each with its name, agent, model and effort,
   working directory, and the state of its most recent turn, including that turn's outcome once it has ended (`SES-8`).
 - `session_send`: sends a message to a session, starting a turn (`TRN-1`), with an optional request ID (`TRN-6`).
@@ -189,6 +193,10 @@ the requirements not yet covered here (reading transcripts) will be added with t
 - `session_interrupt`: starts interrupting a session's running turn (`TRN-4`) and returns immediately with the turn's
   state, which stays "being interrupted" until the agent's processes are gone; the caller follows it with
   `session_read`. If no turn is running, it changes nothing and returns the state of the most recent turn.
+- `session_transcript`: returns a range of entries from the agent's own transcript of the session's conversation
+  (`TRA-2`), addressed by entry number, and the last entries when no start is given. Each entry is the agent's own
+  record with long text cut and marked. Fails, saying why, if the session has no transcript yet or the agent's
+  transcript cannot be found or read.
 - `session_remove`: removes a session (`SES-6`) and returns it as `session_list` showed it last, with whether the
   agent's data was deleted. Takes an optional `force`. Fails if the session does not exist or has a turn in progress,
   and, unless forced, if the agent's data could not be deleted or its deletion cannot be confirmed. A failed removal
