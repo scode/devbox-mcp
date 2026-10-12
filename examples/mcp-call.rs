@@ -62,6 +62,29 @@ struct Args {
     calls: Vec<String>,
 }
 
+/// Environment variables passed through to tunnel-client, and so to devbox-mcp and the real agent, in tunnel mode.
+///
+/// An allowlist rather than the full environment, because tunnel-client reads its configuration (profiles, PID files,
+/// control-plane settings) from environment variables, and a developer's real tunnel setup must not leak into a local
+/// test. What is left is what a real agent needs to find its tools and its login: Codex keeps its credentials under
+/// `HOME` (or `CODEX_HOME`).
+const AGENT_ENV_ALLOWLIST: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "TMPDIR",
+    "CODEX_HOME",
+];
+
+fn agent_env() -> Vec<(String, std::ffi::OsString)> {
+    AGENT_ENV_ALLOWLIST
+        .iter()
+        .filter_map(|&name| std::env::var_os(name).map(|value| (name.to_owned(), value)))
+        .collect()
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -94,6 +117,7 @@ async fn main() -> anyhow::Result<()> {
             &args.server_args,
             scratch.path(),
             Duration::from_secs(args.response_timeout_secs),
+            &agent_env(),
         )
         .await?;
         let client = proxy.connect().await?;

@@ -12,7 +12,9 @@ use std::time::Duration;
 
 use serde_json::json;
 use support::dev_proxy::{DevProxy, default_tunnel_client};
-use support::{DEVBOX_MCP, Harness, assert_all_gone, run_turn, send_signal, structured};
+use support::{
+    DEVBOX_MCP, Harness, assert_all_gone, hermetic_env, run_turn, send_signal, structured,
+};
 
 /// Starts devbox-mcp on this harness behind the pinned tunnel-client.
 async fn start_proxy(h: &Harness) -> DevProxy {
@@ -22,6 +24,7 @@ async fn start_proxy(h: &Harness) -> DevProxy {
         &h.devbox_args(),
         h.tmp.path(),
         Duration::from_secs(30),
+        &hermetic_env(h.tmp.path()),
     )
     .await
     .unwrap()

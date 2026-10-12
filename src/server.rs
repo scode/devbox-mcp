@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
+use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData as McpError, Json, ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
 
@@ -78,6 +79,7 @@ impl DevboxServer {
     async fn run_turn(
         &self,
         Parameters(params): Parameters<RunTurnParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<Json<RunTurnResult>, McpError> {
         let workdir = match params.workdir {
             Some(dir) => PathBuf::from(dir),
@@ -105,12 +107,15 @@ impl DevboxServer {
             model: codex::DEFAULT_MODEL,
             effort: codex::DEFAULT_EFFORT,
         };
-        let outcome = self
-            .config
-            .codex
-            .run_turn(&req)
-            .await
-            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+        // rmcp does not drop a handler's future when the client cancels the call; it only cancels this token. Dropping
+        // the turn is what kills the agent, so racing the two is what makes a cancelled call stop its agent (`LIF-1`).
+        let outcome = tokio::select! {
+            outcome = self.config.codex.run_turn(&req) => outcome,
+            _ = ctx.ct.cancelled() => {
+                return Err(McpError::internal_error("run_turn was cancelled by the client", None));
+            }
+        }
+        .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
         Ok(Json(RunTurnResult {
             completed: outcome.completed,
             reply: outcome.agent_messages.last().cloned(),

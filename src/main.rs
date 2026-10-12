@@ -5,9 +5,11 @@
 //! built and how far along it is.
 
 mod codex;
+mod process;
 mod server;
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context as _, bail};
 use clap::Parser;
@@ -35,11 +37,14 @@ fn default_workdir_root() -> anyhow::Result<PathBuf> {
     Ok(home.join("devbox-mcp").join("work"))
 }
 
-// A current-thread runtime is load-bearing: agent children get a parent-death signal, which Linux ties to the thread
-// that spawned them. With one thread, that is the main thread, which lives exactly as long as the process. See
-// `codex::set_parent_death_signal`.
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> anyhow::Result<()> {
+/// How long shutdown waits for the runtime's blocking threads after in-flight work has been dropped.
+///
+/// The one that matters is rmcp's stdin reader: it sits in a blocking `read` that only returns when stdin closes, so
+/// shutting down on a signal while stdin is still open (systemd stopping a whole service, say) would otherwise wait
+/// forever. Agents are already dead by the time this timeout starts, so cutting it short loses nothing.
+const BLOCKING_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+
+fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let workdir_root = match args.workdir_root {
         Some(dir) => dir,
@@ -51,27 +56,43 @@ async fn main() -> anyhow::Result<()> {
             workdir_root.display()
         );
     }
-
-    // Installed before serving so a signal that arrives during MCP initialization is not lost to the default
-    // disposition, which would kill the process without cleanup.
-    let mut sigterm = signal(SignalKind::terminate()).context("cannot install SIGTERM handler")?;
-    let mut sigint = signal(SignalKind::interrupt()).context("cannot install SIGINT handler")?;
-
-    let server = server::DevboxServer::new(server::Config {
+    let config = server::Config {
         workdir_root,
         codex: codex::Codex {
             bin: args.codex_bin,
         },
-    });
-    let service = server
-        .serve(rmcp::transport::stdio())
-        .await
-        .context("MCP initialization failed")?;
+    };
 
-    // Every way out of here is an orderly shutdown: returning from main drops the tokio runtime, which drops in-flight
-    // tool calls, whose guards kill the agents' process groups (`LIF-1`). That is why SIGTERM and SIGINT are caught
-    // instead of left to kill the process outright: tunnel-client stops its child by closing stdin *and* sending
-    // SIGTERM, and with the default disposition the agents' own children would outlive devbox-mcp.
+    // A current-thread runtime is load-bearing: agent children get a parent-death signal, which Linux ties to the
+    // thread that spawned them. With one thread, that is the main thread, which lives exactly as long as the process.
+    // See `process::set_parent_death_signal`.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("cannot start tokio runtime")?;
+    let result = runtime.block_on(serve(config));
+    // Shutting the runtime down drops every in-flight tool call, and dropping a call kills its agent and everything the
+    // agent started (`LIF-1`).
+    runtime.shutdown_timeout(BLOCKING_SHUTDOWN_TIMEOUT);
+    result
+}
+
+/// Serves MCP over stdio until the client goes away or devbox-mcp is told to stop.
+///
+/// Every way out of here leads to an orderly shutdown in `main`. That is why SIGTERM and SIGINT are caught instead of
+/// left to kill the process outright: tunnel-client stops its child by closing stdin *and* sending SIGTERM, and with the
+/// default disposition the agents' own children would outlive devbox-mcp. The signals are watched during MCP
+/// initialization too, since a client that never finishes initializing must not make devbox-mcp unstoppable.
+async fn serve(config: server::Config) -> anyhow::Result<()> {
+    let mut sigterm = signal(SignalKind::terminate()).context("cannot install SIGTERM handler")?;
+    let mut sigint = signal(SignalKind::interrupt()).context("cannot install SIGINT handler")?;
+
+    let server = server::DevboxServer::new(config);
+    let service = tokio::select! {
+        service = server.serve(rmcp::transport::stdio()) => service.context("MCP initialization failed")?,
+        _ = sigterm.recv() => return Ok(()),
+        _ = sigint.recv() => return Ok(()),
+    };
     tokio::select! {
         result = service.waiting() => {
             result.context("MCP service failed")?;
