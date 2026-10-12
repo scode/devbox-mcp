@@ -9,7 +9,6 @@
 use std::future::Future;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -96,53 +95,53 @@ impl Codex {
     /// Deletes Codex's stored data for a session with `codex delete --force <native id>`, for removing a session
     /// (SPEC.md `SES-6`): the rollout file and Codex's database rows, as checked with codex-cli 0.162.1.
     ///
-    /// The command runs with devbox-mcp's own environment, like the turns, so it works on the same Codex home. If it
-    /// has not finished within `timeout`, its whole process group is killed and the command reaped before this
-    /// returns, so it can never delete anything after the session is back in use. The group matters because `codex`
-    /// may be a launcher (the npm package is a script that starts the real binary as a child), and killing only the
-    /// launcher would leave the deleting process running. Any failure is returned as such, with the command's output
-    /// cut to 2 KiB and marked when cut: Codex
-    /// reports an already deleted session exactly like a real failure, and can fail after deleting part of the data, so
-    /// telling these apart is left to the caller's `force` rather than guessed here.
+    /// The command runs with devbox-mcp's own environment, like the turns, so it works on the same Codex home, and it
+    /// runs the way turns do ([`process::run_agent`]): contained in its own process group and kept unreaped until that
+    /// group has been cleaned up. If it has not finished within `timeout`, it is stopped with everything it started; if
+    /// it exits, whatever it left running in its group is killed. Either way nothing it started can delete anything
+    /// after this returns, when the session may be back in use. The group matters because `codex` may be a launcher (the
+    /// npm package is a script that starts the real binary as a child): an earlier version waited for the launcher
+    /// alone, and a worker it left behind outlived both a timeout and a success. Any failure is returned as such, with
+    /// the command's output cut to 2 KiB and marked when cut: Codex reports an already deleted session exactly like a
+    /// real failure, and can fail after deleting part of the data, so telling these apart is left to the caller's
+    /// `force` rather than guessed here.
     pub async fn delete(&self, native_id: &str, timeout: Duration) -> Result<(), String> {
-        let mut cmd = tokio::process::Command::new(&self.bin);
-        cmd.args(["delete", "--force", native_id])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        process::contain(&mut cmd);
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("cannot run {}: {e}", self.bin.display()))?;
-        let stdout = child.stdout.take().expect("stdout is piped");
-        let stderr = child.stderr.take().expect("stderr is piped");
-        // One byte more than kept, so a cut can be told apart from output that fit exactly.
-        let finished = tokio::time::timeout(timeout, async {
-            tokio::join!(
-                process::read_bounded(stdout, DELETE_OUTPUT_BYTES + 1),
-                process::read_bounded(stderr, DELETE_OUTPUT_BYTES + 1),
-                child.wait(),
-            )
-        })
-        .await;
-        let Ok((stdout, stderr, status)) = finished else {
-            // The command leads its own process group (`process::contain`) and is not reaped yet, so the group ID
-            // cannot have been reused: killing the group reaches only the command and what it started.
-            if let Some(pid) = child.id().and_then(|pid| libc::pid_t::try_from(pid).ok()) {
-                // SAFETY: killpg only sends a signal; the arguments are plain integers.
-                unsafe { libc::killpg(pid, libc::SIGKILL) };
-            }
-            // `kill` waits for the command too, which is the reap the spec asks for.
-            let _ = child.kill().await;
-            return Err(format!(
-                "codex delete did not finish within {} seconds and was stopped",
-                timeout.as_secs()
-            ));
+        let command = AgentCommand {
+            program: self.bin.clone(),
+            args: vec!["delete".into(), "--force".into(), native_id.into()],
+            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+            stdin: Vec::new(),
         };
-        let status = status.map_err(|e| format!("cannot wait for codex delete: {e}"))?;
-        if status.success() {
-            return Ok(());
-        }
+        // One byte more than kept, so a cut can be told apart from output that fit exactly.
+        let mut stdout = String::new();
+        let ended = process::run_agent(
+            command,
+            |line| {
+                if stdout.len() <= DELETE_OUTPUT_BYTES {
+                    stdout.push_str(line);
+                    stdout.push('\n');
+                }
+                ControlFlow::Continue(())
+            },
+            tokio::time::sleep(timeout),
+        )
+        .await
+        .map_err(|e| format!("cannot run {}: {e:#}", self.bin.display()))?;
+        let (status, stderr) = match ended {
+            Ended::Exited { status, .. } if status.success() => return Ok(()),
+            Ended::Exited { status, stderr } => (status, stderr),
+            Ended::Stopped { cleanup_confirmed } => {
+                return Err(format!(
+                    "codex delete did not finish within {} seconds and was stopped{}",
+                    timeout.as_secs(),
+                    if cleanup_confirmed {
+                        ""
+                    } else {
+                        ", but not everything it started could be confirmed stopped"
+                    }
+                ));
+            }
+        };
         let read_cut = stdout.len() > DELETE_OUTPUT_BYTES || stderr.len() > DELETE_OUTPUT_BYTES;
         let output = format!("{}\n{}", stderr.trim(), stdout.trim());
         let (mut output, cut) = crate::events::truncate(

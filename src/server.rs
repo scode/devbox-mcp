@@ -252,9 +252,11 @@ impl DevboxServer {
                        messages, its replies, every command and tool call with its output, and the agent's internal \
                        bookkeeping), as the agent's own JSON entries, one per line of its transcript file. Use it to \
                        see exactly what the agent did, beyond the events session_read gives. Without `from` it \
-                       returns the last entries, so what happened most recently comes first to hand; to look further \
-                       back, read again with `from` set to the first returned index minus `limit`, and use \
-                       `next_from` to page forwards. Strings longer than 4 KiB are cut and end in ' [cut]', and an \
+                       returns the last entries, so what happened most recently comes first to hand. With `from` it \
+                       reads forwards from that index, and `next_from` says where to continue. To look further back, \
+                       read with `from` set to the first index you already have minus `limit` (never below 0), then \
+                       follow `next_from` until you reach entries you already have: a page can hold fewer than \
+                       `limit` entries, because pages are also capped in size. Index 0 is the start. Strings longer than 4 KiB are cut and end in ' [cut]', and an \
                        entry too large even then comes back as the start of its text with `truncated` set. The format \
                        of entries is the agent's own and differs between agents. Fails, saying why, when the session \
                        has no transcript yet or the agent's transcript file cannot be found or read; then ask the \

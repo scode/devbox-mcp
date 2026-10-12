@@ -15,7 +15,7 @@
 
 use std::fs::{self, OpenOptions, Permissions};
 use std::io::{IsTerminal as _, Read as _, Write as _};
-use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -167,14 +167,14 @@ pub fn run(args: SetupArgs) -> anyhow::Result<()> {
         );
     }
 
-    fs::create_dir_all(&unit_dir)
-        .with_context(|| format!("cannot create {}", unit_dir.display()))?;
+    // Whoever can change the unit can change what the service runs, so it is written like the key: privately, and
+    // into directories that, when setup creates them, only the user can enter.
+    create_dirs(&unit_dir)?;
     let unit = unit_dir.join(UNIT_NAME);
-    fs::write(
+    write_private(
         &unit,
-        unit_text(&tunnel_client, &profile_dir, &env_file, path.as_deref()),
-    )
-    .with_context(|| format!("cannot write {}", unit.display()))?;
+        &unit_text(&tunnel_client, &profile_dir, &env_file, path.as_deref()),
+    )?;
 
     // Without a key the service would fail to start, so the first step depends on whether one is there yet.
     let first_step = if env_file.exists() {
@@ -326,30 +326,51 @@ fn read_key() -> anyhow::Result<String> {
 
 /// Creates a directory readable only by the user, or tightens an existing one.
 fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
-    fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    create_dirs(dir)?;
     fs::set_permissions(dir, Permissions::from_mode(0o700))
         .with_context(|| format!("cannot restrict {}", dir.display()))
 }
 
-/// Writes a new file readable only by the user, replacing whatever was at `path`.
+/// Creates `dir` and any missing parents with mode 0700, so that nothing setup creates (`~/.config` itself, on a fresh
+/// account) is open to other users because of a permissive umask. Directories that already exist keep their modes.
+fn create_dirs(dir: &Path) -> anyhow::Result<()> {
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .with_context(|| format!("cannot create {}", dir.display()))
+}
+
+/// Writes a file readable only by the user, atomically replacing whatever was at `path`.
 ///
-/// The old entry is removed rather than opened, so the contents never go through a symlink or hardlink someone left
-/// there into another file, and a file whose mode was loosened is not reused. The new file is created exclusively with
-/// mode 0600, so it is never readable by others, not even briefly.
+/// The contents go to a new temporary file next to `path`, created exclusively with mode 0600 (so they are never
+/// readable by others, not even briefly), and that file is renamed over `path`. Renaming replaces the directory entry,
+/// so the contents never go through a symlink or hardlink someone left at `path`, and a file whose mode was loosened is
+/// not reused. If anything fails before the rename, the old file is still there: a failed key rotation must not leave
+/// the service without a working key at its next start.
 fn write_private(path: &Path, contents: &str) -> anyhow::Result<()> {
-    match fs::remove_file(path) {
+    let mut tmp_name = path.file_name().unwrap_or_default().to_owned();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
+    match fs::remove_file(&tmp) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("cannot replace {}", path.display())),
+        Err(e) => return Err(e).with_context(|| format!("cannot replace {}", tmp.display())),
     }
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(path)
-        .with_context(|| format!("cannot create {}", path.display()))?;
-    file.write_all(contents.as_bytes())
-        .with_context(|| format!("cannot write {}", path.display()))
+        .open(&tmp)
+        .with_context(|| format!("cannot create {}", tmp.display()))?;
+    if let Err(e) = file
+        .write_all(contents.as_bytes())
+        .and_then(|()| file.sync_all())
+    {
+        let _ = fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("cannot write {}", tmp.display()));
+    }
+    fs::rename(&tmp, path).with_context(|| format!("cannot replace {}", path.display()))
 }
 
 /// Whether `path` is a regular file (after following symlinks) that someone may execute.

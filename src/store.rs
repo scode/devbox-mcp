@@ -8,6 +8,7 @@
 use std::fs::{self, File};
 use std::io::Write as _;
 use std::os::fd::AsRawFd as _;
+use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -136,12 +137,18 @@ impl Store {
     /// Blocking: call it before the async runtime starts.
     pub fn open(state_dir: &Path) -> anyhow::Result<Self> {
         let sessions_dir = state_dir.join("sessions");
-        fs::create_dir_all(&sessions_dir)
+        // Records hold agents' replies and failure text, which can include anything the agent saw, so whatever this
+        // creates is private to the user whatever the umask is. Directories that already exist keep their modes.
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&sessions_dir)
             .with_context(|| format!("cannot create state directory {}", sessions_dir.display()))?;
         let lock_path = state_dir.join("lock");
         let lock = File::options()
             .create(true)
             .append(true)
+            .mode(0o600)
             .open(&lock_path)
             .with_context(|| format!("cannot open {}", lock_path.display()))?;
         let deadline = Instant::now() + LOCK_WAIT;
@@ -245,11 +252,23 @@ impl Store {
 
     /// Writes a session's whole record so that the file is always either the old or the new version: a temporary file
     /// next to it is written, flushed to disk, and renamed over the record.
+    ///
+    /// The temporary file is created fresh with mode 0600 (a leftover one is removed first), so the record is private
+    /// whatever the umask is, and a symbolic link at the temporary path is replaced rather than written through.
     pub fn write(&self, record: &Record) -> anyhow::Result<()> {
         let path = self.sessions_dir.join(format!("{}.json", record.name));
         let tmp = self.sessions_dir.join(format!("{}.json.tmp", record.name));
-        let mut file =
-            File::create(&tmp).with_context(|| format!("cannot create {}", tmp.display()))?;
+        match fs::remove_file(&tmp) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("cannot replace {}", tmp.display())),
+        }
+        let mut file = File::options()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .with_context(|| format!("cannot create {}", tmp.display()))?;
         file.write_all(&serde_json::to_vec_pretty(record)?)
             .and_then(|()| file.sync_all())
             .with_context(|| format!("cannot write {}", tmp.display()))?;
