@@ -37,6 +37,83 @@ async fn lists_the_tools() {
     client.cancel().await.unwrap();
 }
 
+/// Spec (`DOC-1`, `DOC-2`, SPEC_impl.md "Self-documentation"): the server instructions are not empty, every tool has a
+/// description and both an argument and a result schema, and every property anywhere in those schemas has a
+/// description.
+///
+/// A calling model learns devbox-mcp only from this self-description, and a field added without a doc comment silently
+/// reaches it as a bare name. This catches such omissions; whether the text is any good is the manual cold-agent check
+/// in docs/testing.md.
+#[tokio::test]
+async fn every_tool_and_field_is_described() {
+    let h = Harness::new();
+    let client = connect(&h).await;
+
+    let instructions = client
+        .peer_info()
+        .and_then(|info| info.instructions.clone())
+        .unwrap_or_default();
+    assert!(!instructions.trim().is_empty(), "no server instructions");
+
+    let mut missing = Vec::new();
+    for tool in client.list_all_tools().await.unwrap() {
+        let name = tool.name.as_ref();
+        if tool.description.as_deref().unwrap_or("").trim().is_empty() {
+            missing.push(format!("{name}: tool description"));
+        }
+        let Some(output) = &tool.output_schema else {
+            missing.push(format!("{name}: result schema"));
+            continue;
+        };
+        for (which, schema) in [("arguments", &tool.input_schema), ("result", output)] {
+            undescribed_properties(
+                &Value::Object((**schema).clone()),
+                &format!("{name} {which}"),
+                &mut missing,
+            );
+        }
+    }
+    assert!(missing.is_empty(), "missing descriptions: {missing:#?}");
+    client.cancel().await.unwrap();
+}
+
+/// Collects, under `path`, every entry of every `properties` map anywhere in `schema` that has no non-empty
+/// `description`.
+///
+/// It visits every object in the schema rather than following `$ref`s, so nested types and `$defs` are covered without
+/// resolving references. Properties fixed to a single value (`const`) are exempt: they are tags, such as the `type`
+/// of an event, which schemars cannot attach a description to and whose tagged object carries one. A property whose schema is only a `$ref` gets its description from the referenced type in
+/// some generators; schemars puts the field's doc comment next to the reference instead, which is what is checked.
+fn undescribed_properties(schema: &Value, path: &str, missing: &mut Vec<String>) {
+    match schema {
+        Value::Object(map) => {
+            if let Some(Value::Object(properties)) = map.get("properties") {
+                for (field, property) in properties {
+                    // A property fixed to one value is a tag, such as an event's `type`, and the description of the
+                    // object it tags explains it.
+                    let described = property.get("const").is_some()
+                        || property
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .is_some_and(|d| !d.trim().is_empty());
+                    if !described {
+                        missing.push(format!("{path}: {field}"));
+                    }
+                }
+            }
+            for (key, value) in map {
+                undescribed_properties(value, &format!("{path}/{key}"), missing);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                undescribed_properties(item, path, missing);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Spec: a turn sends the prompt to the agent in the session's working directory and reports the agent's reply. Also
 /// pins the security-relevant invocation details: the agent runs with permissions bypassed (`SEC-4`) and receives the
 /// prompt on stdin, not on its command line.
