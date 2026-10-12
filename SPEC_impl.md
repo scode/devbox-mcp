@@ -337,7 +337,10 @@ line, where other processes can see it) and does three things:
 - writes the runtime key, as `CONTROL_PLANE_API_KEY=<key>`, to `~/.config/devbox-mcp/tunnel.env`, readable only by the
   user, which the unit loads; the key appears nowhere else;
 - writes the unit, `~/.config/systemd/user/devbox-mcp.service`, from one fixed piece of text with the absolute paths
-  filled in.
+  filled in, plus `Environment=PATH=` with the `PATH` setup runs with, so that the agents' commands find the user's
+  usual tools rather than only those on the systemd user manager's minimal `PATH`. Relative and empty entries (the
+  current directory, which a service must not depend on) and entries that would need escaping in a unit file are left
+  out; setup reports all but the empty ones.
 
 It then prints the remaining commands (enable lingering, reload, enable and start the service) rather than running them.
 It does not pass on `tunnel-client init`'s own output unless init fails: that output advises running tunnel-client in

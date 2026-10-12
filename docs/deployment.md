@@ -95,22 +95,14 @@ enough to get started, for example: "Using devbox, create a session called `smok
 
 ## What the agents' commands can find
 
-Commands an agent runs see the service's environment, not your login shell's. In particular, `PATH` is the systemd user
-manager's, which usually lacks directories such as `~/.local/bin` or `~/.cargo/bin`. To give agents the tools you have
-in your shell, add a drop-in to the unit (setup does not touch it, so it survives running setup again):
+Commands an agent runs see the service's environment, not your login shell's, with one exception: setup writes the
+`PATH` of the shell you ran it in into the unit, so agents find the same tools you do. Without that, the service would
+get the systemd user manager's `PATH`, which usually lacks directories such as `~/.local/bin` or `~/.cargo/bin`. Setup
+leaves out relative entries and entries that would need escaping in a unit file, and says which.
 
-```
-systemctl --user edit devbox-mcp.service
-```
-
-with, for example:
-
-```
-[Service]
-Environment=PATH=/home/you/.local/bin:/home/you/.cargo/bin:/usr/local/bin:/usr/bin:/bin
-```
-
-Then restart the service.
+To change the agents' `PATH`, run setup again from a shell with the `PATH` you want, then reload and restart the
+service. Anything else your shell sets up (other environment variables, aliases, `nvm` and the like) is not carried
+over.
 
 Sessions keep their records in `~/.local/state/devbox-mcp`, and sessions created without an explicit working directory
 work under `~/devbox-mcp/work`.
