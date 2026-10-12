@@ -68,7 +68,8 @@ cargo run --example mcp-call -- --list \
 ```
 
 `wait_turn` is a step of the driver, not an MCP tool: it polls `session_read` once a second until the session's most
-recent turn has ended, then prints every event and the final turn, which is what a caller does by hand.
+recent turn has ended, then prints every event and the final turn, which is what a caller does by hand. For a Claude
+session, pass `"agent": "claude"` to `session_create`; `"model": "sonnet", "effort": "low"` keeps manual runs cheap.
 
 Add `--via-tunnel-client` to route the calls through tunnel-client's dev proxy instead of talking stdio directly. That
 is the closest local equivalent of production, and the mode to use whenever timing or the number of calls matters:
@@ -93,6 +94,15 @@ the conversation, look for the rollout file under `$CODEX_HOME/sessions` and for
 `$CODEX_HOME/state_5.sqlite` before and after (both named by the session's native ID, the `native_id` in its record
 under `--state-dir`).
 
+Removing a Claude session deletes Claude Code's per-session files itself. Give Claude a scratch configuration directory
+the same way: a fresh directory holding copies of `~/.claude/.credentials.json` (the login) and `~/.claude.json`, with
+`CLAUDE_CONFIG_DIR` set to it. Claude Code then reads both from there, and keeps its sessions under that directory's
+`projects/`. Delete the directory when you are done, since it holds a copy of your login. Your own
+`~/.claude/CLAUDE.md`, settings, and skills are not loaded in that setup, which is fine for checking devbox-mcp but not
+what a deployed service's Claude sessions see. To check that a removal deleted everything, look for files and
+directories named with the session's `native_id` anywhere under `$CLAUDE_CONFIG_DIR` before and after; for a Claude
+session the native ID is devbox-mcp's own choice, saved before Claude first runs.
+
 Expect `wait_turn` to show the events `turn_started`, `agent_message`, and `turn_ended`, and a turn with state
 `completed` and the agent's reply in `final_message`. A hello world turn took about 10 seconds when this was written.
 Adding a second `session_send` and `wait_turn` to the same session, asking the agent about its previous turn, checks
@@ -112,7 +122,7 @@ cfg="$(printf '{"mcpServers":{"devbox":{"command":"%s","args":["--workdir-root",
     "$bin" "$work" "$work")"
 (cd "$work" && claude -p --mcp-config "$cfg" --strict-mcp-config \
     --tools '' --allowedTools mcp__devbox__session_create mcp__devbox__session_list mcp__devbox__session_send \
-        mcp__devbox__session_read mcp__devbox__session_interrupt -- \
+        mcp__devbox__session_read mcp__devbox__session_interrupt mcp__devbox__session_transcript -- \
     "On the dev box, have the agent say hello world, and tell me exactly what it replied." < /dev/null)
 ```
 
@@ -156,6 +166,16 @@ made and what came back. The prompts used so far:
   without `force`. If the turn was interrupted before Codex reported its conversation ID, as happened when this was
   first run, removal is refused because devbox-mcp cannot confirm the deletion, and the model should tell the user and
   ask rather than force it. Reaching for `force` on its own is misuse.
+- Claude session: "On my dev box, have a Claude agent, not Codex, create a file hi.txt containing hi in its working
+  directory, using a small fast model, and tell me which model it ran on." Expect `agent: claude` and a model the model
+  chose for itself, such as `sonnet` or `haiku`, reported back from the session summary.
+- Unsupported effort: "On my dev box, start a Claude agent with reasoning effort turbo and have it say hi." Expect the
+  creation to fail with the list of efforts Claude accepts, and the model to tell the user or pick one of those, not to
+  conclude that Codex would also reject it.
+- Transcript: "On my dev box, have an agent run the shell commands 'echo one' and then 'echo two', then reply with the
+  word done. After that, without asking the agent anything, show me the last few entries of the agent's own record of
+  that session." Expect `session_transcript` without `from`, and the entries quoted or summarized. Run it a second time
+  asking for "a Claude agent, not Codex, using a small fast model", since the two agents' transcripts differ.
 
 A model with nothing else to do polls `session_read` back to back, since print mode has no way to wait; around 70 reads
 for a 90-second turn were seen, and say nothing about the descriptions. So the budget is generous but finite: a scenario
@@ -164,7 +184,10 @@ before the outcome it was asked for. Misuse that does say something about them (
 misreading a result) is fixed in the descriptions, not in the prompts. To see what the client actually showed the model,
 ask it in one more run to quote the devbox-mcp tool descriptions and any server instructions it was given. When this was
 written, Claude Code showed the server instructions, the tool descriptions, and the argument schemas, but not the result
-schemas, which is why anything a caller must know about a result is also in the tool's description.
+schemas, which is why anything a caller must know about a result is also in the tool's description. It does check every
+result against the tool's result schema, though, and turns a mismatch into a tool error the model sees instead of the
+result; rmcp's client in the hermetic tests does not, so those tests check results against the schemas themselves
+(`call_checked` in `tests/support`). A field left out of a result must therefore be optional in its schema.
 
 Running from a scratch directory keeps this repository's instructions out, but Claude Code still loads your own
 user-level instructions (`~/.claude/CLAUDE.md`), and the model may mention them. `--bare` would skip them but only

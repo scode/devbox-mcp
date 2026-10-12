@@ -40,7 +40,7 @@ Proves the agent-adapter boundary on a second agent before more is built on it.
 
 - [x] Spec. Claude's adapter in SPEC_impl.md (non-interactive mode, resuming by session ID, permissions bypassed per
       `SEC-4`, how its output maps to turn events) and anything about agent choice that step 1 left open.
-- [ ] Plan and implement.
+- [x] Plan and implement.
 
 #### Step 4: transcripts
 
@@ -49,7 +49,7 @@ agents.
 
 - [x] Spec. The transcript read tool: how ranges are addressed, what an entry looks like, how much of the agent's native
       format is passed through, and bounds.
-- [ ] Plan and implement.
+- [x] Plan and implement.
 
 ### Contain agents in a cgroup
 

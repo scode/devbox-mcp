@@ -18,6 +18,9 @@ tunnel-client's own health and admin listener on a Unix socket only your user ca
 - A Rust toolchain, to build devbox-mcp from this repository.
 - Codex installed and logged in as that user (`codex login`). Agents use your Codex login and configuration, including
   your own `AGENTS.md` rules.
+- Optionally, Claude Code installed and logged in as that user, for sessions created with agent `claude`. They use your
+  Claude Code login and configuration, including your `CLAUDE.md`, settings, hooks, and skills. Without it, Codex
+  sessions work as usual and a Claude session's turns fail saying that `claude` could not be started.
 - An OpenAI tunnel: its ID (`tunnel_` followed by 32 lowercase letters or digits) from the
   [tunnel management page](https://platform.openai.com/settings/organization/tunnels), and a runtime API key for it from
   the [API keys page](https://platform.openai.com/settings/organization/api-keys).
@@ -52,9 +55,10 @@ You need this once per box, and again only to replace the key; rerunning setup l
 ```
 
 Run the installed `~/.local/bin/devbox-mcp`, not `cargo run`: setup tells tunnel-client to start the very binary that
-ran setup. It finds Codex on your `PATH` (pass `--codex-bin` to pick another one) and expects tunnel-client at
-`~/.local/bin/tunnel-client` (or `--tunnel-client`). Paths containing whitespace, quotes, backslashes, `%`, or `$` are
-refused rather than escaped.
+ran setup. It finds Codex on your `PATH` (pass `--codex-bin` to pick another one), and Claude Code too if it is there
+(`--claude-bin`), and expects tunnel-client at `~/.local/bin/tunnel-client` (or `--tunnel-client`). If you install
+Claude Code later, run setup again so the service knows where it is. Paths containing whitespace, quotes, backslashes,
+`%`, or `$` are refused rather than escaped.
 
 Setup writes two files and starts nothing:
 
@@ -141,6 +145,6 @@ rm ~/.config/systemd/user/devbox-mcp.service ~/.config/devbox-mcp/tunnel.env ~/.
 systemctl --user daemon-reload
 ```
 
-Session records (`~/.local/state/devbox-mcp`), working directories (`~/devbox-mcp/work`), and the agents' own data (for
-Codex, under `~/.codex`) are left alone; delete them too if you no longer want them. Revoke the runtime key on the API
-keys page if it should stop working.
+Session records (`~/.local/state/devbox-mcp`), working directories (`~/devbox-mcp/work`), and the agents' own data
+(under `~/.codex` for Codex and `~/.claude` for Claude Code) are left alone; delete them too if you no longer want them.
+Revoke the runtime key on the API keys page if it should stop working.
