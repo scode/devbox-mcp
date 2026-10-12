@@ -41,17 +41,20 @@ pub struct SessionCreateParams {
     /// is, with whatever it already contains, and may be shared with other sessions. Omit it to use a directory named
     /// after the session under devbox-mcp's default root (also reused if it already exists).
     pub workdir: Option<String>,
-    /// The agent to run in this session. Only `codex` is available, and it is the default.
+    /// The agent to run in this session: `codex` (OpenAI's Codex CLI, the default) or `claude` (Anthropic's Claude
+    /// Code). Fixed for the session's life.
     pub agent: Option<Agent>,
-    /// The model the agent runs, for example `gpt-6.1-sol` (the default when omitted): 1 to 128 characters from A-Z,
-    /// a-z, 0-9, `.`, `_`, `:`, `/`, and `-`. Fixed for the session's life; use a new session to switch. That check is
-    /// only about characters: devbox-mcp does not check that the agent knows the model, and if it does not, the
-    /// session's turns fail with the agent's own error, which names the problem.
+    /// The model the agent runs: 1 to 128 characters from A-Z, a-z, 0-9, `.`, `_`, `:`, `/`, and `-`. Defaults to
+    /// `gpt-6.1-sol` for codex and `opus` for claude (which also takes `sonnet`, `haiku`, or a full model ID). Fixed for
+    /// the session's life; use a new session to switch. That check is only about characters: devbox-mcp does not check
+    /// that the agent knows the model, and if it does not, the session's turns fail with the agent's own error, which
+    /// names the problem.
     pub model: Option<String>,
-    /// The reasoning effort, for example `low`, `medium`, `high` (the default when omitted), `xhigh`, or `max`: 1 to
-    /// 32 characters from a-z, 0-9, `_`, and `-`. Fixed for the session's life. That check is only about characters:
-    /// which efforts are available depends on the model, and an unsupported one makes the session's turns fail with an
-    /// error listing the valid values.
+    /// The reasoning effort, for example `low`, `medium`, `high` (the default for both agents), `xhigh`, or `max`: 1 to
+    /// 32 characters from a-z, 0-9, `_`, and `-`. Fixed for the session's life. For claude it must be one of those five
+    /// and anything else is rejected when the session is created. For codex the check is only about characters: which
+    /// efforts are available depends on the model, and an unsupported one makes the session's turns fail with an error
+    /// listing the valid values.
     pub effort: Option<String>,
 }
 
@@ -138,14 +141,18 @@ impl DevboxServer {
 
     /// Creates a session (SPEC.md `SES-1` to `SES-3`, `SES-7`).
     #[tool(
-        description = "Create a new session: a long-lived conversation with a coding agent (Codex) that runs on this \
-                       Linux box with full access to it, working in one directory. Create one per piece of work you \
-                       want to come back to; later messages to the same session keep the agent's context. You may \
-                       choose the model and reasoning effort; both are fixed for the session's life and shown in the \
-                       returned session, and one the agent does not support makes the session's turns fail with the \
-                       agent's own error rather than being ignored. Returns the session. Fails if the name is invalid or already taken: an existing session with that name is \
-                       shown in the error, so if it is yours, keep using it instead of creating another. Next, give \
-                       the agent work with session_send."
+        description = "Create a new session: a long-lived conversation with a coding agent (Codex by default, or \
+                       Claude Code) that runs on this Linux box with full access to it, working in one directory. \
+                       Create one per piece of work you want to come back to; later messages to the same session keep \
+                       the agent's context. You may choose the agent, model, and reasoning effort; all are fixed for \
+                       the session's life and shown in the returned session. A choice the agent does not support is \
+                       never silently ignored, but whether it is rejected here depends on the agent and the value: an \
+                       unknown Claude effort is rejected now, while an unknown model, or an effort Codex's model does \
+                       not support, is accepted here and makes the session's turns fail with the agent's own error. \
+                       So a successful creation does not mean the agent supports your choice, and what one agent \
+                       rejects here says nothing about another. Returns the session. Fails if the name is invalid or \
+                       already taken: an existing session with that name is shown in the error, so if it is yours, \
+                       keep using it instead of creating another. Next, give the agent work with session_send."
     )]
     async fn session_create(
         &self,
@@ -271,11 +278,13 @@ impl DevboxServer {
                        files in it are left alone. Returns the session as it was, and whether the agent's data was \
                        deleted. Fails if the session has a turn running or being interrupted (wait for it to end, or \
                        stop it with session_interrupt first). Also fails, keeping the session, when devbox-mcp cannot \
-                       confirm that the agent's data was deleted: the agent's delete command failed, or the session \
-                       had a conversation whose ID devbox-mcp never learned (it then cannot delete it). Such a failure \
+                       confirm that the agent's data was deleted: deleting it failed or left data devbox-mcp does not \
+                       know how to remove, or the session had a conversation whose ID devbox-mcp never learned (it \
+                       then cannot delete it). Such a failure \
                        says why; retrying may help if the cause was temporary. Only pass `force: true` when the user \
                        wants the session gone even if the agent's data may remain; do not use it by default. This \
-                       call waits up to 10 seconds for the agent's delete command."
+                       call can take several seconds: up to 10 for Codex's delete command, and for Claude the time to \
+                       delete its files and check that none are left."
     )]
     async fn session_remove(
         &self,
@@ -310,7 +319,7 @@ impl ServerHandler for DevboxServer {
 /// programs that give up on end of input, not for all of them, which is why the text promises no more than that.
 fn instructions(unix_user: &str) -> String {
     format!(
-        "devbox-mcp runs coding agents (Codex) on a remote Linux box, with full access to it, on your behalf. \
+        "devbox-mcp runs coding agents (Codex or Claude Code) on a remote Linux box, with full access to it, on your behalf. \
          Work happens in sessions: a session is a long-lived conversation with one agent, working in one \
          directory, that you can come back to later with its context intact. Typical use: session_create once, \
          then session_send a message (it returns at once; the agent works in the background), then \
@@ -328,8 +337,8 @@ fn instructions(unix_user: &str) -> String {
          A program may handle missing input differently, though, for example by asking again forever, and nothing \
          times commands out, so ask the agent to run things non-interactively; if a turn stops producing events \
          while its agent stays alive, check on it and interrupt it if it is stuck. A session's model \
-         and reasoning effort are fixed when it is created and shown in its summary. devbox-mcp does not check \
-         them against a list of models, so an unsupported one is not ignored: the session's turns fail with the \
-         agent's own error saying what is wrong."
+         and reasoning effort are fixed when it is created and shown in its summary. devbox-mcp keeps no list of \
+         models, so an unsupported choice is not ignored: depending on the agent and the value, either creating \
+         the session fails or the session's turns fail with the agent's own error saying what is wrong."
     )
 }

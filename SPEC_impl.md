@@ -6,14 +6,12 @@ agreement.
 
 ## Implementation status
 
-The code is an early prototype that implements steps 1 and 2 of the roadmap in TODO.md. Implemented: the stdio transport
-and the security posture (`SEC-*`, `TSP-1`), `LIF-1` for orderly shutdowns, sessions (`SES-*`) with the Codex adapter, a
-model and effort chosen at creation, and removal, the session store of "Storage", and turns (`TRN-*`) with "Turn
-lifecycle", "Turn events", cursors, request IDs, liveness, and the bounds of `BND-*`, through the session tools, and
-`session_transcript` (`TRA-2`) for Codex sessions.
-
-Specified below for steps 3 and 4 of the roadmap but not yet implemented: Claude as a second agent, including its
-transcripts. "Deployment" is implemented by `devbox-mcp setup`; [docs/deployment.md](docs/deployment.md) is the guide.
+The code is an early prototype that implements steps 1 to 4 of the roadmap in TODO.md. Implemented: the stdio transport
+and the security posture (`SEC-*`, `TSP-1`), `LIF-1` for orderly shutdowns, sessions (`SES-*`) with the Codex and Claude
+adapters, a model and effort chosen at creation, and removal, the session store of "Storage", and turns (`TRN-*`) with
+"Turn lifecycle", "Turn events", cursors, request IDs, liveness, and the bounds of `BND-*`, through the session tools,
+and `session_transcript` (`TRA-2`) for both agents. "Deployment" is implemented by `devbox-mcp setup`;
+[docs/deployment.md](docs/deployment.md) is the guide.
 
 ## Language and dependencies
 
@@ -129,11 +127,12 @@ starts a fresh conversation under the same ID, reporting `context_reset` (see "C
 
 A record also says whether an earlier conversation of the session was never tracked: whether the agent may hold data
 under an ID devbox-mcp cannot account for, which it therefore cannot delete, so removal requires `force`. For Codex that
-is set when a send starts a fresh conversation because the previous one could not be resumed (`context_reset`, `SES-5`).
-For Claude it is set only when Claude reports a different conversation ID than the one devbox-mcp chose (see "Claude");
-a Claude restart under its own known ID leaves nothing untracked. Records written before this was tracked lack it; for
-them nobody knows, so a session past its first turn is treated as possibly having such a conversation (a reset needs an
-earlier turn), and one still at its first turn as not having one.
+is set when a send starts a fresh conversation because the previous one could not be resumed (`context_reset`, `SES-5`),
+or when a resumed turn reports a different conversation than the one resumed (see "Codex"). For Claude it is set only
+when Claude reports a different conversation ID than the one devbox-mcp chose (see "Claude"); a Claude restart under its
+own known ID leaves nothing untracked. Records written before this was tracked lack it; for them nobody knows, so a
+session past its first turn is treated as possibly having such a conversation (a reset needs an earlier turn), and one
+still at its first turn as not having one.
 
 Records are read at startup. A most recent turn still recorded as `running` or `interrupting` is reported as `lost`
 (`TRN-5`); the file itself is updated with the session's next write. A record that cannot be parsed is left untouched, a
@@ -381,7 +380,9 @@ The Codex adapter uses non-interactive mode, checked against codex-cli 0.162.1:
   `SEC-4`, devbox-mcp deliberately does not pass `--ignore-rules`. A command those rules reject shows up as a declined
   or failed command in the turn's events.
 - The native session ID is the `thread_id` of the `thread.started` event, recorded as soon as it is seen. Never use
-  `--last`, which picks whatever session ran most recently.
+  `--last`, which picks whatever session ran most recently. A resumed turn that reports a different `thread_id` than the
+  one resumed is aborted, and the session is marked as having an untracked conversation (see "Storage"), since Codex may
+  have stored data under the other ID.
 - `--skip-git-repo-check` is needed because Codex otherwise refuses to run outside a git repository, and session working
   directories need not be repositories.
 - Defaults: model `gpt-6.1-sol`, reasoning effort `high`. Which efforts a model supports varies by model; an unsupported
@@ -425,8 +426,12 @@ The Claude adapter uses Claude Code's print mode, checked against Claude Code 2.
   stdin and the child's working directory set to the session's.
 - The bypass flag turns off all of Claude Code's permission checks (`SEC-4`). The user's own Claude Code configuration
   (`CLAUDE.md`, settings, hooks, skills) stays in force, as Codex's rules do; devbox-mcp passes nothing to disable it.
-  Implementation checks that nothing in print mode waits for an answer nobody can give (a question tool, for example),
-  and disallows such a tool with `--disallowedTools` if one does.
+  Nothing in print mode may wait for an answer nobody can give; a question tool that did would be disallowed with
+  `--disallowedTools`. Checked with 2.1.296: print mode offers no question tool (its tool list has no
+  `AskUserQuestion`), so nothing is disallowed.
+- Claude Code opens a Unix socket for messages between its own sessions, at `/run/user/<uid>/cc-socks/<pid>.sock`
+  (2.1.296). The directory is the user's runtime directory, mode 0700, so only the user the agent already runs as can
+  reach it, which `SEC-3` allows: it is the agent's own local mechanism, not a way into the box.
 - The native session ID is chosen by devbox-mcp: a random UUID, saved in the record that accepts the session's first
   send, before Claude starts. A later send looks for Claude's transcript for that ID first, with three outcomes: exactly
   one found, so the turn resumes it; the lookup completed and found none, so the turn starts the conversation again
@@ -436,7 +441,9 @@ The Claude adapter uses Claude Code's print mode, checked against Claude Code 2.
   not retried as a fresh start.
 - The `session_id` of the stream's `system` `init` event must match the chosen ID; a mismatch aborts the turn, as with
   Codex, and marks the session as having an untracked conversation, since Claude may already have stored data under the
-  other ID. Short of that, the ID is always known before Claude runs, so removal can check that the data is gone.
+  other ID. For both agents the mark is saved the moment the mismatch is seen, not when the turn is settled, so a turn
+  that then fails some other way (unreadable output, a shutdown) cannot lose it. Short of that, the ID is always known
+  before Claude runs, so removal can check that the data is gone.
 - Defaults: model `opus`, effort `high`. Efforts are checked at creation (see "Tools"); an unknown model fails the turn
   with the API's error, which arrives as an error `result` event.
 - Event mapping, from `stream-json` output (shapes observed with 2.1.296):
