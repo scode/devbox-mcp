@@ -236,3 +236,41 @@ mod tests {
         );
     }
 }
+
+// What a running turn reports, shared by the agent adapters (`codex.rs`, `claude.rs`).
+
+/// Something a running turn reports as soon as it is known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Progress {
+    /// The agent's own session ID for this conversation, needed to resume it later (`SES-5`).
+    NativeId(String),
+    /// The agent reported a different conversation than the one the turn was meant to use, so it may have stored data
+    /// under an ID devbox-mcp cannot account for (SPEC_impl.md, "Storage", untracked conversation). Reported the moment
+    /// it is seen, not with the turn's outcome: the session must record it even if reading the agent's remaining output
+    /// fails or devbox-mcp shuts down before the turn is settled, or a later removal would report the data deleted.
+    ForeignConversation,
+    Event(AgentEvent),
+}
+
+/// How a turn ended, as far as the agent and its process told us.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnResult {
+    Completed,
+    Failed {
+        error: String,
+    },
+    /// Stopped by an interrupt.
+    Interrupted,
+}
+
+/// Everything a finished turn leaves behind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Outcome {
+    pub result: TurnResult,
+    /// False when the turn was stopped (interrupted, or aborted by this module) and not everything the agent started
+    /// could be confirmed stopped; the session layer reports that as uncertain cleanup (`LIF-2`). Kept apart from
+    /// `result` because an aborted turn is reported as failed, and the uncertainty must survive that too.
+    pub cleanup_confirmed: bool,
+    /// The text of the agent's last message, uncut; the caller bounds it where it stores or returns it.
+    pub final_message: Option<String>,
+}

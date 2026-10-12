@@ -16,12 +16,14 @@ use chrono::{DateTime, Utc};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
-/// The agents a session can run. Only Codex so far (SPEC.md `SES-7`).
+/// The agents a session can run (SPEC.md `SES-7`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Agent {
     /// OpenAI's Codex CLI.
     Codex,
+    /// Anthropic's Claude Code.
+    Claude,
 }
 
 /// The states a turn can be in (SPEC.md `TRN-5`, SPEC_impl.md "Turn lifecycle").

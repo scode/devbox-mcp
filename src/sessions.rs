@@ -17,8 +17,11 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::oneshot;
 
-use crate::codex::{self, Codex, Outcome, Progress, TurnRequest, TurnResult};
-use crate::events::{Event, EventKind, Keep, MAX_TEXT_BYTES, truncate};
+use crate::claude::{self, Claude};
+use crate::codex::{self, Codex};
+use crate::events::{
+    Event, EventKind, Keep, MAX_TEXT_BYTES, Outcome, Progress, TurnResult, truncate,
+};
 use crate::store::{AcceptedRequest, Agent, Record, Store, TurnRecord, TurnState};
 use crate::transcript::{self, Page};
 
@@ -33,6 +36,7 @@ pub struct Config {
     /// Default working directories are `<workdir_root>/<name>` (SPEC.md `SES-3`).
     pub workdir_root: PathBuf,
     pub codex: Codex,
+    pub claude: Claude,
 }
 
 /// A failed session operation, worded for the calling agent (SPEC.md `DOC-3`): what went wrong and what to do.
@@ -291,11 +295,26 @@ impl Sessions {
         effort: Option<&str>,
     ) -> Result<SessionSummary, SessionError> {
         validate_name(name)?;
+        let agent = agent.unwrap_or(Agent::Codex);
+        let (default_model, default_effort) = match agent {
+            Agent::Codex => (codex::DEFAULT_MODEL, codex::DEFAULT_EFFORT),
+            Agent::Claude => (claude::DEFAULT_MODEL, claude::DEFAULT_EFFORT),
+        };
         if let Some(model) = model {
-            validate_model(model)?;
+            validate_model(model, default_model)?;
         }
         if let Some(effort) = effort {
-            validate_effort(effort)?;
+            validate_effort(effort, default_effort)?;
+            // Claude ignores an effort it does not know with only a warning on stderr, so the session would silently
+            // run at Claude's default instead (SPEC.md `SES-7`). Codex rejects an unknown effort itself, per turn.
+            if agent == Agent::Claude && !claude::EFFORTS.contains(&effort) {
+                return Err(SessionError::Invalid(format!(
+                    "invalid effort {} for a claude session: Claude accepts {}, or omit it to use the default ({})",
+                    shown(effort),
+                    claude::EFFORTS.join(", "),
+                    claude::DEFAULT_EFFORT
+                )));
+            }
         }
         let mut table = self.table.lock().unwrap();
         if let Some(existing) = table.sessions.get(name) {
@@ -335,10 +354,10 @@ impl Sessions {
         }
         let record = Record {
             name: name.to_owned(),
-            agent: agent.unwrap_or(Agent::Codex),
+            agent,
             workdir,
-            model: model.unwrap_or(codex::DEFAULT_MODEL).to_owned(),
-            effort: effort.unwrap_or(codex::DEFAULT_EFFORT).to_owned(),
+            model: model.unwrap_or(default_model).to_owned(),
+            effort: effort.unwrap_or(default_effort).to_owned(),
             native_id: None,
             turn: None,
             requests: Vec::new(),
@@ -418,9 +437,10 @@ pub struct SendResult {
     /// (a retried send of an older turn, or after devbox-mcp restarted); read without a cursor then, keeping in mind
     /// that a read always shows the session's most recent turn, which may be a later one than this.
     pub cursor: Option<String>,
-    /// True when the agent could not continue its earlier conversation in this session, because devbox-mcp never
-    /// learned that conversation's ID (the previous turn failed or was stopped before the agent got going, or
-    /// devbox-mcp restarted early in it), so this turn starts a fresh conversation without the earlier context.
+    /// True when this turn starts a fresh conversation without the session's earlier context, because the agent could
+    /// not continue the earlier one. For codex, devbox-mcp never learned that conversation's ID (the previous turn
+    /// failed or was stopped before the agent got going, or devbox-mcp restarted early in it). For claude, the
+    /// agent's own record of the conversation was gone, so the conversation starts over under the same ID.
     pub context_reset: bool,
 }
 
@@ -552,12 +572,85 @@ fn sha256_hex(text: &str) -> String {
         .collect()
 }
 
+/// How a send's turn joins the agent's conversation, settled before the turn is accepted because `context_reset` is
+/// part of the send's result.
+struct ConversationStart {
+    /// The native ID saved with the turn: for Codex the one already learned, if any (Codex reports a new one when it
+    /// starts); for Claude always set, since devbox-mcp chooses it.
+    native_id: Option<String>,
+    /// Claude only: continue the conversation (`--resume`) rather than start it under `native_id`.
+    resume: bool,
+    /// The turn starts a fresh conversation although an earlier turn ran, so the agent has lost what came before
+    /// (SPEC.md `SES-5`).
+    context_reset: bool,
+}
+
+/// Decides how the next turn of `record`'s session joins its conversation (SPEC_impl.md, "Claude" and "Storage").
+///
+/// Codex: resume the learned ID; without one, a session past its first turn lost its conversation (the first turn
+/// ended before Codex reported it), so the turn starts fresh and says so. Claude: the first send chooses the ID; later
+/// sends resume it if Claude's transcript is there, start it again under the same ID if the lookup completed and found
+/// none, and fail the send if the lookup failed or found several, since resuming the wrong one or silently starting over
+/// would both mislead the caller.
+///
+/// The Claude lookup lists Claude's `projects/` directory and checks one path in each entry. It runs with the table lock
+/// held, which blocks devbox-mcp's single thread for that long (about 200 entries on the box this was written on, well
+/// under a millisecond to a few milliseconds); doing it outside the lock would need the send's checks done twice.
+fn conversation_start(claude: &Claude, record: &Record) -> Result<ConversationStart, SessionError> {
+    let earlier_turn = record.turn.is_some();
+    match (record.agent, &record.native_id) {
+        (Agent::Codex, native_id) => Ok(ConversationStart {
+            native_id: native_id.clone(),
+            resume: native_id.is_some(),
+            context_reset: native_id.is_none() && earlier_turn,
+        }),
+        (Agent::Claude, None) => {
+            let id = claude::new_session_id().map_err(|e| {
+                SessionError::Internal(format!(
+                    "could not choose an ID for Claude's conversation, so nothing was sent: {e}"
+                ))
+            })?;
+            Ok(ConversationStart {
+                native_id: Some(id),
+                resume: false,
+                context_reset: earlier_turn,
+            })
+        }
+        (Agent::Claude, Some(id)) => {
+            let found = claude.find_transcripts(id).map_err(|e| {
+                SessionError::Internal(format!(
+                    "could not look for Claude's transcript of this session's conversation, so nothing was sent and \
+                     Claude was not started: {e}"
+                ))
+            })?;
+            match found.len() {
+                1 => Ok(ConversationStart {
+                    native_id: Some(id.clone()),
+                    resume: true,
+                    context_reset: false,
+                }),
+                0 => Ok(ConversationStart {
+                    native_id: Some(id.clone()),
+                    resume: false,
+                    context_reset: earlier_turn,
+                }),
+                n => Err(SessionError::Internal(format!(
+                    "found {n} transcripts of this session's Claude conversation under {}, so devbox-mcp cannot tell \
+                     which one to continue; nothing was sent. A human needs to look at Claude's files; removing the \
+                     session (session_remove) deletes all of them",
+                    claude.home.join("projects").display()
+                ))),
+            }
+        }
+    }
+}
+
 /// Checks a caller-chosen model name (SPEC_impl.md, "Tools"): 1 to 128 characters from `A-Z a-z 0-9 . _ : / -`.
 ///
 /// This is only about what can be handed to the agent safely, not about what the agent supports: devbox-mcp keeps no
 /// model list (SPEC.md `SES-7`), so a model the agent does not know makes the session's turns fail with the agent's own
 /// error instead.
-fn validate_model(model: &str) -> Result<(), SessionError> {
+fn validate_model(model: &str, default: &str) -> Result<(), SessionError> {
     let ok = !model.is_empty()
         && model.len() <= 128
         && model
@@ -570,7 +663,7 @@ fn validate_model(model: &str) -> Result<(), SessionError> {
             "invalid model {}: use 1 to 128 characters from A-Z, a-z, 0-9, '.', '_', ':', '/', and '-', or omit it to \
              use the default ({})",
             shown(model),
-            codex::DEFAULT_MODEL
+            default
         )))
     }
 }
@@ -580,7 +673,7 @@ fn validate_model(model: &str) -> Result<(), SessionError> {
 /// The effort goes into a TOML override on Codex's command line (`-c model_reasoning_effort="<effort>"`), so the
 /// characters are restricted to ones that cannot break out of that string. Which efforts a model supports is the
 /// agent's business, as for the model.
-fn validate_effort(effort: &str) -> Result<(), SessionError> {
+fn validate_effort(effort: &str, default: &str) -> Result<(), SessionError> {
     let ok = !effort.is_empty()
         && effort.len() <= 32
         && effort
@@ -593,7 +686,7 @@ fn validate_effort(effort: &str) -> Result<(), SessionError> {
             "invalid effort {}: use 1 to 32 characters from a-z, 0-9, '_', and '-' (for example low, medium, high, \
              xhigh), or omit it to use the default ({})",
             shown(effort),
-            codex::DEFAULT_EFFORT
+            default
         )))
     }
 }
@@ -692,14 +785,17 @@ impl Sessions {
             return Err(busy);
         }
 
-        // A conversation that once existed but whose native ID devbox-mcp never learned (the first turn was lost before
-        // the agent reported it) cannot be resumed; this turn starts a fresh one and says so (`SES-5`).
-        let context_reset = session.record.native_id.is_none() && session.record.turn.is_some();
+        let start = conversation_start(&self.config.claude, &session.record)?;
+        let context_reset = start.context_reset;
         let turn_id = session.record.turn.as_ref().map_or(1, |t| t.id + 1);
         let mut record = session.record.clone();
-        // Saved with the turn itself, so a removal can never miss that an earlier conversation may still exist.
-        record.untracked_conversation =
-            Some(record.may_have_untracked_conversation() || context_reset);
+        record.native_id = start.native_id.clone();
+        // Saved with the turn itself, so a removal can never miss that an earlier conversation may still exist. Only a
+        // Codex reset leaves one behind: a Claude restart reuses the ID devbox-mcp chose, so nothing becomes untracked.
+        record.untracked_conversation = Some(
+            record.may_have_untracked_conversation()
+                || (context_reset && record.agent == Agent::Codex),
+        );
         record.turn = Some(TurnRecord {
             id: turn_id,
             state: TurnState::Running,
@@ -741,10 +837,10 @@ impl Sessions {
             cursor: session.cursor_before_turn(turn_id),
             context_reset,
         };
+        let agent = session.record.agent;
         let workdir = session.record.workdir.clone();
         let model = session.record.model.clone();
         let effort = session.record.effort.clone();
-        let resume = session.record.native_id.clone();
         drop(table);
 
         // The turn belongs to the session, not to this call (`TRN-1`): it is a task of its own, which only an
@@ -753,28 +849,45 @@ impl Sessions {
         let name = name.to_owned();
         let message = message.to_owned();
         tokio::spawn(async move {
-            let req = TurnRequest {
-                prompt: &message,
-                workdir: &workdir,
-                model: &model,
-                effort: &effort,
-                resume: resume.as_deref(),
-            };
             let interrupt = async {
                 // A dropped sender (the turn's bookkeeping going away) is not an interrupt.
                 if interrupt_rx.await.is_err() {
                     std::future::pending::<()>().await;
                 }
             };
-            let outcome = this
-                .config
-                .codex
-                .run_turn(
-                    &req,
-                    |progress| this.progress(&name, turn_id, progress),
-                    interrupt,
-                )
-                .await;
+            let on_progress = |progress| this.progress(&name, turn_id, progress);
+            let outcome = match (agent, &start.native_id) {
+                (Agent::Codex, resume) => {
+                    let req = codex::TurnRequest {
+                        prompt: &message,
+                        workdir: &workdir,
+                        model: &model,
+                        effort: &effort,
+                        resume: resume.as_deref(),
+                    };
+                    this.config
+                        .codex
+                        .run_turn(&req, on_progress, interrupt)
+                        .await
+                }
+                (Agent::Claude, Some(session_id)) => {
+                    let req = claude::TurnRequest {
+                        prompt: &message,
+                        workdir: &workdir,
+                        model: &model,
+                        effort: &effort,
+                        session_id,
+                        resume: start.resume,
+                    };
+                    this.config
+                        .claude
+                        .run_turn(&req, on_progress, interrupt)
+                        .await
+                }
+                (Agent::Claude, None) => {
+                    unreachable!("conversation_start always chooses a Claude conversation ID")
+                }
+            };
             this.finish(&name, turn_id, outcome);
         });
         Ok(result)
@@ -802,6 +915,19 @@ impl Sessions {
                              ends; if devbox-mcp restarts before then, the next turn starts a fresh conversation: {e:#}"
                         ));
                     }
+                }
+            }
+            Progress::ForeignConversation => {
+                // The agent ran in a conversation devbox-mcp did not ask for and may have stored data under its ID,
+                // which removal cannot find. Saved now rather than with the turn's end, which a read error or a
+                // shutdown can keep from ever being recorded.
+                session.record.untracked_conversation = Some(true);
+                if let Err(e) = self.store.write(&session.record) {
+                    session.push_storage_error(&format!(
+                        "devbox-mcp could not save that the agent ran in a conversation it did not ask for, and tries \
+                         again when the turn ends; if devbox-mcp restarts before then, removing this session may \
+                         report the agent's data deleted when some of it remains: {e:#}"
+                    ));
                 }
             }
             Progress::Event(event) => session.push_event(event.kind, event.truncated),
@@ -926,9 +1052,11 @@ impl Sessions {
             }
         };
         let codex = self.config.codex.clone();
+        let claude = self.config.claude.clone();
         let read = tokio::task::spawn_blocking(move || {
             let path = match agent {
                 Agent::Codex => codex.transcript_path(&native_id)?,
+                Agent::Claude => claude.transcript_path(&native_id)?,
             };
             transcript::read(&path, from, limit)
         })
@@ -952,7 +1080,7 @@ impl Sessions {
     /// is set, nothing needs re-checking afterwards. rmcp does not drop a handler when the client cancels the call, so
     /// the flag is always cleared on the way out; only shutdown drops this future, and the flag dies with the process.
     pub async fn remove(&self, name: &str, force: bool) -> Result<RemoveResult, SessionError> {
-        let (native_id, confirmable) = {
+        let (agent, native_id, confirmable) = {
             let mut table = self.table.lock().unwrap();
             let session = table
                 .sessions
@@ -978,12 +1106,19 @@ impl Sessions {
                 )));
             }
             session.removing = true;
-            (record.native_id.clone(), confirmable)
+            (record.agent, record.native_id.clone(), confirmable)
         };
 
-        let deleted = match &native_id {
-            Some(id) => self.config.codex.delete(id, codex::DELETE_TIMEOUT).await,
-            None => Ok(()),
+        let deleted = match (agent, &native_id) {
+            (Agent::Codex, Some(id)) => self.config.codex.delete(id, codex::DELETE_TIMEOUT).await,
+            (Agent::Claude, Some(id)) => {
+                let claude = self.config.claude.clone();
+                let id = id.clone();
+                tokio::task::spawn_blocking(move || claude.delete(&id))
+                    .await
+                    .unwrap_or_else(|e| Err(format!("deleting Claude's files failed: {e}")))
+            }
+            (_, None) => Ok(()),
         };
 
         let mut table = self.table.lock().unwrap();

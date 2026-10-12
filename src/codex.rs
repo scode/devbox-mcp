@@ -14,7 +14,9 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::events::{AgentEvent, Bounder, EventKind, FileChangeEntry, Keep};
+use crate::events::{
+    AgentEvent, Bounder, EventKind, FileChangeEntry, Keep, Outcome, Progress, TurnResult,
+};
 use crate::process::{self, AgentCommand, Ended};
 
 /// Default model for Codex sessions, per SPEC_impl.md.
@@ -55,37 +57,6 @@ pub struct TurnRequest<'a> {
     pub effort: &'a str,
     /// Codex's own session ID to continue, or `None` to start a fresh conversation.
     pub resume: Option<&'a str>,
-}
-
-/// Something a running turn reports as soon as it is known.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Progress {
-    /// Codex's own session ID for this conversation, needed to resume it later (`SES-5`).
-    NativeId(String),
-    Event(AgentEvent),
-}
-
-/// How a turn ended, as far as Codex and its process told us.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TurnResult {
-    Completed,
-    Failed {
-        error: String,
-    },
-    /// Stopped by an interrupt.
-    Interrupted,
-}
-
-/// Everything a finished turn leaves behind.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Outcome {
-    pub result: TurnResult,
-    /// False when the turn was stopped (interrupted, or aborted by this module) and not everything the agent started
-    /// could be confirmed stopped; the session layer reports that as uncertain cleanup (`LIF-2`). Kept apart from
-    /// `result` because an aborted turn is reported as failed, and the uncertainty must survive that too.
-    pub cleanup_confirmed: bool,
-    /// The text of the agent's last message, uncut; the caller bounds it where it stores or returns it.
-    pub final_message: Option<String>,
 }
 
 impl Codex {
@@ -309,6 +280,7 @@ impl CodexTurn {
                         self.abort_reason = Some(format!(
                             "Codex resumed session {id} instead of {expected}; the turn was stopped"
                         ));
+                        on_progress(Progress::ForeignConversation);
                         return ControlFlow::Break(());
                     }
                     on_progress(Progress::NativeId(id));
@@ -727,12 +699,13 @@ mod tests {
     }
 
     /// A resumed turn that reports a different native session must be stopped, not continued in the wrong conversation
-    /// (`SES-5`); a matching one is reported as usual.
+    /// (`SES-5`), and reported at once as a foreign conversation so the session is marked before anything else can go
+    /// wrong; a matching one is reported as usual.
     #[test]
     fn stops_on_a_mismatched_resume() {
         let (progress, flows, turn) =
             feed(Some("a"), &[r#"{"type":"thread.started","thread_id":"b"}"#]);
-        assert!(progress.is_empty());
+        assert_eq!(progress, vec![Progress::ForeignConversation]);
         assert!(flows[0].is_break());
         assert!(turn.abort_reason.is_some());
 
@@ -783,7 +756,7 @@ mod tests {
     }
 
     /// Once a turn is aborted, output Codex still prints (drained after the stop) belongs to the wrong conversation and
-    /// is not reported.
+    /// is not reported; only the foreign conversation that caused the abort is.
     #[test]
     fn ignores_output_after_an_abort() {
         let (progress, _, _) = feed(
@@ -793,7 +766,7 @@ mod tests {
                 r#"{"type":"item.completed","item":{"id":"i","type":"agent_message","text":"hi"}}"#,
             ],
         );
-        assert!(progress.is_empty());
+        assert_eq!(progress, vec![Progress::ForeignConversation]);
     }
 
     /// Every string field is bounded, not only the obviously long ones: a file path, an ID, or a status from a

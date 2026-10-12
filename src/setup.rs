@@ -40,6 +40,12 @@ pub struct SetupArgs {
     #[arg(long)]
     codex_bin: Option<PathBuf>,
 
+    /// The Claude Code executable the service runs. Defaults to `claude` as found on PATH now, for the same reason; if
+    /// it is not there, the service is set up without it and Claude sessions use whatever `claude` the service's PATH
+    /// holds, so a box without Claude Code can still serve Codex sessions.
+    #[arg(long)]
+    claude_bin: Option<PathBuf>,
+
     /// The tunnel-client executable the service runs. Defaults to ~/.local/bin/tunnel-client.
     #[arg(long)]
     tunnel_client: Option<PathBuf>,
@@ -100,6 +106,7 @@ pub fn run(args: SetupArgs) -> anyhow::Result<()> {
         Some(path) => path,
         None => find_on_path("codex").context("codex is not on PATH; pass --codex-bin")?,
     };
+    let claude = args.claude_bin.or_else(|| find_on_path("claude"));
     let tunnel_client = args
         .tunnel_client
         .unwrap_or_else(|| home.join(".local/bin/tunnel-client"));
@@ -108,19 +115,18 @@ pub fn run(args: SetupArgs) -> anyhow::Result<()> {
     let profile_dir = config.join("tunnel-client");
     let env_file = key_file(&home);
     let unit_dir = config.join("systemd/user");
-    for (what, path) in [
+    let mut executables = vec![
         ("devbox-mcp", &devbox_mcp),
         ("codex", &codex),
         ("tunnel-client", &tunnel_client),
-        ("home", &home),
-    ] {
+    ];
+    if let Some(claude) = &claude {
+        executables.push(("claude", claude));
+    }
+    for (what, path) in executables.iter().copied().chain([("home", &home)]) {
         plain_path(what, path)?;
     }
-    for (what, path) in [
-        ("devbox-mcp", &devbox_mcp),
-        ("codex", &codex),
-        ("tunnel-client", &tunnel_client),
-    ] {
+    for (what, path) in executables {
         if !is_executable(path) {
             bail!("{what} at {} is missing or not executable", path.display());
         }
@@ -134,7 +140,10 @@ pub fn run(args: SetupArgs) -> anyhow::Result<()> {
         );
     }
 
-    let mcp_command = format!("{} --codex-bin {}", devbox_mcp.display(), codex.display());
+    let mut mcp_command = format!("{} --codex-bin {}", devbox_mcp.display(), codex.display());
+    if let Some(claude) = &claude {
+        mcp_command.push_str(&format!(" --claude-bin {}", claude.display()));
+    }
     // init's own stdout is kept from the user: it advises running `tunnel-client run` in the foreground, which would
     // serve the admin API on loopback TCP (the profile's default) instead of the unit's private socket (`SEC-3`). It is
     // shown only if init fails, since its error messages may be there.

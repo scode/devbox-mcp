@@ -137,10 +137,67 @@ echo '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","tex
 echo '{"type":"turn.completed","usage":{}}'
 "#;
 
+/// A stand-in for Claude Code in print mode (`claude -p --output-format stream-json ...`), shaped after what Claude Code
+/// 2.1.296 was observed to print and store. Like the fake Codex, it lives in the harness's `fake` directory and records
+/// its last invocation next to itself: `claude-argv` (one argument per line), `claude-stdin`, and `claude-cwd`.
+///
+/// It takes the conversation ID from `--session-id` or `--resume` and keeps Claude's per-session files under
+/// `$HOME/.claude` (devbox-mcp's test `HOME` is the harness's temporary directory): it appends one line per turn to the
+/// transcript `projects/<working directory with / and . as ->/<id>.jsonl`, and creates `session-env/<id>` and
+/// `file-history/<id>`. A `--resume` of an ID with no transcript fails the way Claude does, with an error result.
+///
+/// Its stream is an `init` event with the conversation ID, an assistant message with text and a `Bash` call, the
+/// call's result, and a successful `result` whose text echoes the message. A file named `claude-mode` next to it changes
+/// that: `error` ends with an error `result`, `no-result` exits 1 after the `init` event with a message on stderr,
+/// `mismatch` reports a different conversation ID in `init`, `mismatch-garbage` does that and then prints bytes that
+/// are not UTF-8, so reading its output fails after the mismatch was seen, and `leftover` also creates
+/// `tasks/<id>.json`, a file devbox-mcp does not know to delete.
+pub const FAKE_CLAUDE: &str = r#"#!/bin/sh
+dir=$(dirname "$0")
+printf '%s\n' "$@" > "$dir/claude-argv"
+pwd > "$dir/claude-cwd"
+prompt=$(cat)
+printf '%s' "$prompt" > "$dir/claude-stdin"
+mode=$(cat "$dir/claude-mode" 2>/dev/null)
+id=""
+resume=no
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --session-id) id=$2; shift ;;
+    --resume) id=$2; resume=yes; shift ;;
+  esac
+  shift
+done
+home="$HOME/.claude"
+project="$home/projects/$(pwd | tr '/.' '--')"
+reported=$id
+case "$mode" in mismatch*) reported=00000000-0000-4000-8000-000000000000 ;; esac
+echo "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"$reported\"}"
+[ "$mode" = mismatch-garbage ] && printf '\377\376\n' && exit 0
+if [ "$resume" = yes ] && ! ls "$home"/projects/*/"$id.jsonl" >/dev/null 2>&1; then
+  echo "{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"result\":\"No conversation found with session ID: $id\"}"
+  exit 1
+fi
+mkdir -p "$project" "$home/session-env/$id" "$home/file-history/$id"
+echo "{\"type\":\"user\",\"sessionId\":\"$id\"}" >> "$project/$id.jsonl"
+[ "$mode" = leftover ] && mkdir -p "$home/tasks" && echo '{}' > "$home/tasks/$id.json"
+if [ "$mode" = no-result ]; then
+  echo "fake claude crashed" >&2
+  exit 1
+fi
+echo '{"type":"assistant","message":{"content":[{"type":"text","text":"Looking."},{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}]}}'
+echo '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","is_error":false,"content":"a.txt"}]}}'
+if [ "$mode" = error ]; then
+  echo '{"type":"result","subtype":"success","is_error":true,"result":"API Error: fake model problem"}'
+  exit 1
+fi
+echo '{"type":"result","subtype":"success","is_error":false,"result":"fake claude reply: '"$prompt"'"}'
+"#;
+
 /// Path of the devbox-mcp binary under test, built by Cargo for this test run.
 pub const DEVBOX_MCP: &str = env!("CARGO_BIN_EXE_devbox-mcp");
 
-/// Per-test sandbox: a fake Codex, a working directory root, and scratch space, all in one temporary directory that is
+/// Per-test sandbox: a fake Codex and a fake Claude, a working directory root, and scratch space, all in one temporary directory that is
 /// removed when the harness is dropped.
 pub struct Harness {
     pub tmp: TempDir,
@@ -157,6 +214,9 @@ impl Harness {
         std::fs::create_dir(&fake_dir).unwrap();
         let fake = fake_dir.join("codex");
         std::fs::write(&fake, FAKE_CODEX).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let fake = fake_dir.join("claude");
+        std::fs::write(&fake, FAKE_CLAUDE).unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         let workdir_root = tmp.path().join("work");
         let state_dir = tmp.path().join("state");
@@ -175,6 +235,8 @@ impl Harness {
             self.workdir_root.to_str().unwrap().to_owned(),
             "--codex-bin".to_owned(),
             self.fake_dir.join("codex").to_str().unwrap().to_owned(),
+            "--claude-bin".to_owned(),
+            self.fake_dir.join("claude").to_str().unwrap().to_owned(),
             "--state-dir".to_owned(),
             self.state_dir.to_str().unwrap().to_owned(),
         ]

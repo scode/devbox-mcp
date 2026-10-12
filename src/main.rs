@@ -4,6 +4,7 @@
 //! way into the box of its own (SPEC.md, `SEC-2`). See SPEC.md for what it promises and SPEC_impl.md for how it is
 //! built and how far along it is.
 
+mod claude;
 mod codex;
 mod events;
 mod process;
@@ -35,6 +36,10 @@ struct Args {
     /// The Codex executable to run.
     #[arg(long, default_value = "codex")]
     codex_bin: PathBuf,
+
+    /// The Claude Code executable to run.
+    #[arg(long, default_value = "claude")]
+    claude_bin: PathBuf,
 
     /// Directory for session records. Defaults to $XDG_STATE_HOME/devbox-mcp, or ~/.local/state/devbox-mcp. Must be
     /// absolute. Only one devbox-mcp can use a state directory at a time.
@@ -142,6 +147,10 @@ fn main() -> anyhow::Result<()> {
             codex: codex::Codex {
                 bin: args.codex_bin,
                 home: agent_home("CODEX_HOME", ".codex")?,
+            },
+            claude: claude::Claude {
+                bin: args.claude_bin,
+                home: agent_home("CLAUDE_CONFIG_DIR", ".claude")?,
             },
         },
     )?);
