@@ -98,6 +98,48 @@ async fn later_turns_resume_the_agent_conversation() {
     client.cancel().await.unwrap();
 }
 
+/// Spec (`SES-7`): a session's chosen model and effort reach the agent on its first turn and on resumed turns, and
+/// are still the session's after devbox-mcp restarts, since the choice is fixed for the session's life.
+#[tokio::test]
+async fn chosen_model_and_effort_are_used_for_every_turn() {
+    let h = Harness::new();
+    let client = connect(&h).await;
+    call(
+        &client,
+        "session_create",
+        json!({ "name": "alpha", "model": "gpt-x", "effort": "low" }),
+    )
+    .await
+    .unwrap();
+
+    let expect_choice = |argv: &str| {
+        let args: Vec<&str> = argv.lines().collect();
+        assert!(
+            args.windows(2).any(|w| w == ["-m", "gpt-x"]),
+            "model missing: {argv}"
+        );
+        assert!(
+            args.contains(&"model_reasoning_effort=\"low\""),
+            "effort missing: {argv}"
+        );
+    };
+    let sent = send(&client, "alpha", "first").await;
+    read_until_ended(&client, "alpha", sent["cursor"].as_str().map(str::to_owned)).await;
+    expect_choice(&h.recorded("argv"));
+    client.cancel().await.unwrap();
+
+    let client = connect(&h).await;
+    let listed = structured(&call(&client, "session_list", json!({})).await.unwrap());
+    assert_eq!(listed["sessions"][0]["model"], "gpt-x");
+    assert_eq!(listed["sessions"][0]["effort"], "low");
+    let sent = send(&client, "alpha", "second").await;
+    read_until_ended(&client, "alpha", sent["cursor"].as_str().map(str::to_owned)).await;
+    let argv = h.recorded("argv");
+    assert_eq!(argv.lines().nth(1), Some("resume"), "{argv}");
+    expect_choice(&argv);
+    client.cancel().await.unwrap();
+}
+
 /// Spec (`TRN-2`, `TRN-4`, `LIF-1`): a send to a busy session is rejected with an error that says what to do; an
 /// interrupt returns at once with `interrupting`, the turn then ends `interrupted`, and the agent's whole process tree is
 /// gone.

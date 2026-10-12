@@ -41,6 +41,16 @@ pub struct SessionCreateParams {
     pub workdir: Option<String>,
     /// The agent to run in this session. Only `codex` is available, and it is the default.
     pub agent: Option<Agent>,
+    /// The model the agent runs, for example `gpt-6.1-sol` (the default when omitted): 1 to 128 characters from A-Z,
+    /// a-z, 0-9, `.`, `_`, `:`, `/`, and `-`. Fixed for the session's life; use a new session to switch. That check is
+    /// only about characters: devbox-mcp does not check that the agent knows the model, and if it does not, the
+    /// session's turns fail with the agent's own error, which names the problem.
+    pub model: Option<String>,
+    /// The reasoning effort, for example `low`, `medium`, `high` (the default when omitted), `xhigh`, or `max`: 1 to
+    /// 32 characters from a-z, 0-9, `_`, and `-`. Fixed for the session's life. That check is only about characters:
+    /// which efforts are available depends on the model, and an unsupported one makes the session's turns fail with an
+    /// error listing the valid values.
+    pub effort: Option<String>,
 }
 
 // Arguments of `session_list`.
@@ -100,7 +110,8 @@ impl DevboxServer {
     #[tool(
         description = "Create a new session: a long-lived conversation with a coding agent (Codex) that runs on this \
                        Linux box with full access to it, working in one directory. Create one per piece of work you \
-                       want to come back to; later messages to the same session keep the agent's context. Returns the \
+                       want to come back to; later messages to the same session keep the agent's context. You may \
+                       choose the model and reasoning effort; both are fixed for the session's life. Returns the \
                        session. Fails if the name is invalid or already taken: an existing session with that name is \
                        shown in the error, so if it is yours, keep using it instead of creating another. Next, give \
                        the agent work with session_send."
@@ -113,14 +124,16 @@ impl DevboxServer {
             &params.name,
             params.workdir.as_deref(),
             params.agent,
+            params.model.as_deref(),
+            params.effort.as_deref(),
         )?))
     }
 
     /// Lists sessions a page at a time (SPEC.md `SES-4`).
     #[tool(
         description = "List the sessions on this box, in name order, up to 50 per call, with each session's agent, \
-                       working directory, and its most recent turn (its state and, once it has ended, the start of the \
-                       agent's final message). Use it to find sessions you created earlier, for example after \
+                       model and effort, working directory, and its most recent turn (its state and, once it has ended, \
+                       the start of the agent's final message). Use it to find sessions you created earlier, for example after \
                        reconnecting. When `next_after` is set, call again with `after` set to it for the next page."
     )]
     async fn session_list(

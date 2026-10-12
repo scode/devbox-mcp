@@ -28,8 +28,9 @@ fn error_text(result: Result<CallToolResult, rmcp::ServiceError>) -> String {
     }
 }
 
-/// Spec (`SES-1`, `SES-3`, `SES-4`): a created session shows up in the listing with its agent and a default working
-/// directory named after it under the configured root, which is created.
+/// Spec (`SES-1`, `SES-3`, `SES-4`, `SES-7`): a created session shows up in the listing with its agent, the documented
+/// default model and effort, and a default working directory named after it under the configured root, which is
+/// created.
 #[tokio::test]
 async fn creates_and_lists_a_session() {
     let h = Harness::new();
@@ -41,7 +42,10 @@ async fn creates_and_lists_a_session() {
     let workdir = h.workdir_root.join("alpha");
     assert_eq!(
         structured(&created),
-        &json!({ "name": "alpha", "agent": "codex", "workdir": workdir.to_str().unwrap(), "turn": null })
+        &json!({
+            "name": "alpha", "agent": "codex", "model": "gpt-6.1-sol", "effort": "high",
+            "workdir": workdir.to_str().unwrap(), "turn": null
+        })
     );
     assert!(workdir.is_dir());
 
@@ -50,6 +54,45 @@ async fn creates_and_lists_a_session() {
         structured(&listed),
         &json!({ "sessions": [structured(&created)], "next_after": null })
     );
+    client.cancel().await.unwrap();
+}
+
+/// Spec (`SES-7`, SPEC_impl.md "Tools"): model and effort are checked only for characters that are safe to pass to the
+/// agent, and a value outside them is rejected with an error that says what is allowed, before anything is created.
+/// Unknown but well-formed values are accepted, since the agent is the one that knows what it supports.
+#[tokio::test]
+async fn checks_model_and_effort_characters() {
+    let h = Harness::new();
+    let client = connect(&h).await;
+
+    for (field, value) in [
+        ("model", "gpt 6"),
+        ("model", ""),
+        ("effort", "High"),
+        ("effort", "x\"y"),
+    ] {
+        let error = error_text(
+            call(
+                &client,
+                "session_create",
+                json!({ "name": "alpha", field: value }),
+            )
+            .await,
+        );
+        assert!(error.contains(&format!("invalid {field}")), "{error}");
+    }
+    assert!(!h.workdir_root.join("alpha").exists());
+
+    let created = call(
+        &client,
+        "session_create",
+        json!({ "name": "alpha", "model": "some-future/model:v2", "effort": "ultra" }),
+    )
+    .await
+    .unwrap();
+    let created = structured(&created);
+    assert_eq!(created["model"], "some-future/model:v2");
+    assert_eq!(created["effort"], "ultra");
     client.cancel().await.unwrap();
 }
 
