@@ -72,7 +72,7 @@ struct Args {
 /// An allowlist rather than the full environment, because tunnel-client reads its configuration (profiles, PID files,
 /// control-plane settings) from environment variables, and a developer's real tunnel setup must not leak into a local
 /// test. What is left is what a real agent needs to find its tools and its login: Codex keeps its credentials under
-/// `HOME` (or `CODEX_HOME`).
+/// `HOME` (or `CODEX_HOME`), and Claude Code under `HOME` (or `CLAUDE_CONFIG_DIR`).
 const AGENT_ENV_ALLOWLIST: &[&str] = &[
     "PATH",
     "HOME",
@@ -81,6 +81,7 @@ const AGENT_ENV_ALLOWLIST: &[&str] = &[
     "LANG",
     "TMPDIR",
     "CODEX_HOME",
+    "CLAUDE_CONFIG_DIR",
 ];
 
 fn agent_env() -> Vec<(String, std::ffi::OsString)> {
