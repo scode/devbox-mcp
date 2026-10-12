@@ -6,28 +6,13 @@ agreement.
 
 ## Implementation status
 
-The code is a primordial prototype whose job is to prove the end-to-end path (MCP client, devbox-mcp, agent, reply) and
-the testing flow around it. It exposes a single tool, `run_turn`, which runs one Codex turn in a fresh session and
-blocks until the turn ends, returning the agent's final message. Implemented so far: the stdio transport and the
-security posture (`SEC-*`, `TSP-1`), a first Codex adapter, and `LIF-1` for orderly shutdowns.
+The code is an early prototype, part way through step 1 of the roadmap in TODO.md. Implemented: the stdio transport and
+the security posture (`SEC-*`, `TSP-1`), `LIF-1` for orderly shutdowns, sessions (`SES-*` except removal) with the Codex
+adapter, the session store of "Storage", and turns (`TRN-*`) with "Turn lifecycle", "Turn events", cursors, request IDs,
+liveness, and the bounds of `BND-*`, through the five session tools.
 
-Not yet implemented, and contradicted by the prototype until it is: turns that run in the background and are read
-incrementally (`TRN-*`; `run_turn` blocks instead), transcripts (`TRA-*`), model and effort selection (`SES-7`), and
-response bounds for `run_turn` (`BND-1`; it returns the whole reply and blocks for as long as the turn takes).
-`run_turn` goes away once sessions can run turns; it ignores sessions and still uses `--workdir-root` directly as its
-default working directory.
-
-Step 1 of the roadmap in TODO.md is being implemented. Done so far:
-
-- the Codex module resumes sessions and maps Codex's output into the agent-agnostic events of "Turn events" (without the
-  session-level `turn_started` and `turn_ended`), and `process::run_agent` runs any agent process with the containment
-  of "Process model", including interrupts;
-- the session store of "Storage" (records, load-time mapping of unfinished turns to `lost`, unreadable records, the
-  state directory lock; request IDs come with sends) and the `session_create` and `session_list` tools, with all the
-  configuration flags below.
-
-Still to come: `session_send`, `session_read`, and `session_interrupt` with "Turn lifecycle" and the session-level
-events, the "Self-documentation" checks, and "Deployment".
+Not yet implemented: transcripts (`TRA-*`), session removal (`SES-1`, `SES-6`), the automated "Self-documentation"
+checks, and "Deployment".
 
 ## Language and dependencies
 
@@ -57,21 +42,19 @@ SIGTERM to every process of a service at once, with stdin still open. devbox-mcp
 SIGTERM, and SIGINT alike as a request for an orderly shutdown, including while MCP initialization is still in progress.
 It shuts its tokio runtime down, which drops every in-flight task, and dropping the task that owns an agent kills the
 agent. The runtime's shutdown waits at most a second for blocking threads, because rmcp's stdin reader stays blocked in
-`read` for as long as stdin is open. A tool call the client cancels (`notifications/cancelled`) is dropped too; rmcp
-only signals the cancellation, so the handler races its work against it. In the prototype the agent belongs to the
-`run_turn` call, so cancelling the call kills it. With sessions, a turn belongs to its session, not to any call, and
-cancelling a call never affects it (see "Turn lifecycle").
+`read` for as long as stdin is open. A turn belongs to its session, not to the call that started it, so a tool call the
+client cancels (`notifications/cancelled`) never affects a turn (see "Turn lifecycle").
 
 Each turn is an agent child process started with an argument array, never a shell string, in its own process group.
 Killing that group is not enough: Codex runs every shell command in a new session, so a command's own children are in
 another process group (observed with codex-cli 0.162.1, where `bash -c "sleep 303 & sleep 120"` left both sleeps running
-after Codex was killed). A guard owned by the turn therefore kills the agent's whole process tree when the call is
-dropped. It walks `/proc` one generation at a time, whatever each process's session or group, and stops each generation
-(confirming the stops took effect) before reading its children: a stopped process can neither fork nor reap, so the PIDs
-it walks cannot be reused under it. It then kills deepest first, because killing a parent before its stopped children
-can orphan their process groups, and the kernel continues the stopped members of a newly orphaned group. Both rules came
-from the second adversarial review, which showed processes escaping without them. `/proc/<pid>/stat` is parsed as bytes,
-since process names need not be UTF-8.
+after Codex was killed). A guard owned by the turn therefore kills the agent's whole process tree when the turn is
+interrupted or its task is dropped at shutdown. It walks `/proc` one generation at a time, whatever each process's
+session or group, and stops each generation (confirming the stops took effect) before reading its children: a stopped
+process can neither fork nor reap, so the PIDs it walks cannot be reused under it. It then kills deepest first, because
+killing a parent before its stopped children can orphan their process groups, and the kernel continues the stopped
+members of a newly orphaned group. Both rules came from the second adversarial review, which showed processes escaping
+without them. `/proc/<pid>/stat` is parsed as bytes, since process names need not be UTF-8.
 
 When the agent exits on its own, the turn ends at its exit rather than when its output pipes close, which a leftover
 background process could keep open forever. The exit is noticed with `waitid(WNOWAIT)`, which leaves the agent unreaped,
@@ -111,11 +94,12 @@ Each session is one JSON file, `<state-dir>/sessions/<name>.json`. It holds:
 - the name, agent, working directory, model and effort, and the agent's native session ID once known (`SES-5`);
 - the most recent turn (`SES-8`): its ID (turn IDs count up from 1 within a session), its state, when it started and
   ended, the agent's final message (at most 32 KiB, cut with a `final_message_truncated` flag), and, for a failed turn,
-  the error that ended it (at most 4 KiB);
-- every request ID the session has accepted (`TRN-6`), each with a SHA-256 of its message and the turn it started. They
-  are kept for the session's whole life, so a retry is recognized however late it comes; each costs about a hundred
-  bytes per turn. (SHA-256 rather than Rust's built-in hasher, whose output may change between Rust releases and would
-  then reject legitimate retries after an upgrade.)
+  the error that ended it (at most 4 KiB, ending in ` [cut]` when it was longer);
+- every request ID the session has accepted (`TRN-6`), each with a SHA-256 of its message, the turn it started, and
+  whether that turn reset the agent's context (`SES-5`), so a retry reports the reset too. They are kept for the
+  session's whole life, so a retry is recognized however late it comes; each costs about a hundred bytes per turn.
+  (SHA-256 rather than Rust's built-in hasher, whose output may change between Rust releases and would then reject
+  legitimate retries after an upgrade.)
 
 Every change rewrites the whole record synchronously: write a temporary file with a fixed name next to it, `fsync` it,
 and rename it over the record. The runtime is single-threaded and a write has no `.await` in it, so two writes can never
@@ -164,8 +148,11 @@ as MCP structured content and, for clients that ignore that, as the same JSON as
   stored `final_message`. `gap` is true when events may be missing between the cursor and the first event returned.
   `more` is true when the response hit its bounds and further events are already waiting. Liveness values are null when
   unknown: `agent_alive` when there is no running turn, `last_event_age_seconds` when no event is held,
-  `turn_duration_seconds` when a lost turn's end is unknown; for a running turn `turn_duration_seconds` is the time
-  since it started, for an ended one the time it ran. Times are RFC 3339 timestamps in UTC; durations are whole seconds.
+  `turn_duration_seconds` when a lost turn's end is unknown. `agent_alive` is true until the turn ends, which can be a
+  few seconds after the agent exits, while its last output is collected and anything it left running is stopped;
+  tracking the exit separately for that window would not change what a caller does. For a running turn
+  `turn_duration_seconds` is the time since it started, for an ended one the time it ran. Times are RFC 3339 timestamps
+  in UTC; durations are whole seconds.
 - `session_interrupt { name }`: returns the most recent turn as in a summary, normally with state `interrupting`.
 
 Cursors are opaque strings that encode the session name, an ID of the devbox-mcp process that issued them (random at

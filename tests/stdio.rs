@@ -1,17 +1,17 @@
 //! End-to-end tests of the real devbox-mcp binary over plain stdio, the transport tunnel-client uses to talk to it.
 //!
 //! These tests play tunnel-client's role directly, which makes them fast and lets them control exactly what devbox-mcp
-//! sees. tests/tunnel.rs repeats the important paths with the real tunnel-client in between.
+//! sees. They focus on how devbox-mcp runs agent processes (outcomes, pipes, shutdown, cleanup); tests/turns.rs covers
+//! the session and turn rules, and tests/tunnel.rs repeats the important paths with the real tunnel-client in between.
 
 mod support;
 
 use std::path::Path;
 use std::time::Duration;
 
-use rmcp::model::CallToolRequestParams;
 use serde_json::{Value, json};
 use support::{
-    DEVBOX_MCP, Harness, assert_all_gone, connect, hermetic_env, run_turn, send_signal, structured,
+    DEVBOX_MCP, Harness, assert_all_gone, connect, hermetic_env, run_session_turn, send_signal,
 };
 use tokio::process::Command;
 
@@ -24,30 +24,35 @@ async fn lists_the_tools() {
     let tools = client.list_all_tools().await.unwrap();
     let mut names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
     names.sort();
-    assert_eq!(names, ["run_turn", "session_create", "session_list"]);
+    assert_eq!(
+        names,
+        [
+            "session_create",
+            "session_interrupt",
+            "session_list",
+            "session_read",
+            "session_send"
+        ]
+    );
     client.cancel().await.unwrap();
 }
 
-/// Spec: a turn sends the prompt to the agent, runs in the default working directory when none is given, and returns
-/// the agent's reply and native session ID. Also pins the security-relevant invocation details: the agent must run with
-/// permissions bypassed (`SEC-4`) and receive the prompt on stdin, not on its command line.
+/// Spec: a turn sends the prompt to the agent in the session's working directory and reports the agent's reply. Also
+/// pins the security-relevant invocation details: the agent runs with permissions bypassed (`SEC-4`) and receives the
+/// prompt on stdin, not on its command line.
 #[tokio::test]
 async fn runs_a_turn_and_returns_the_reply() {
     let h = Harness::new();
     let client = connect(&h).await;
 
-    let result = run_turn(&client, json!({ "prompt": "say hello world" })).await;
-    assert_eq!(result.is_error, Some(false));
-    let out = structured(&result);
-    assert_eq!(out["completed"], true);
-    assert_eq!(out["reply"], "fake reply: say hello world");
-    assert_eq!(out["agent_session_id"], "fake-thread-1");
-    assert_eq!(out["workdir"], h.workdir_root.display().to_string());
+    let (_, last) = run_session_turn(&client, "alpha", "say hello world").await;
+    assert_eq!(last["turn"]["state"], "completed");
+    assert_eq!(last["turn"]["final_message"], "fake reply: say hello world");
 
     assert_eq!(h.recorded("stdin"), "say hello world");
     assert_eq!(
         Path::new(h.recorded("cwd").trim()),
-        h.workdir_root.canonicalize().unwrap()
+        h.workdir_root.join("alpha").canonicalize().unwrap()
     );
     let argv = h.recorded("argv");
     assert!(
@@ -62,17 +67,21 @@ async fn runs_a_turn_and_returns_the_reply() {
     client.cancel().await.unwrap();
 }
 
-/// Spec (`LIF-2`): a turn the agent reports as failed is reported as not completed, with the agent's own error text,
-/// rather than as a generic tool error or, worse, as success.
+/// Spec (`LIF-2`, `SES-8`): a turn the agent reports as failed is reported as failed, with the agent's own error text,
+/// rather than as success.
 #[tokio::test]
 async fn reports_a_failed_turn_honestly() {
     let h = Harness::new();
     let client = connect(&h).await;
-
-    let result = run_turn(&client, json!({ "prompt": "fail please" })).await;
-    let out = structured(&result);
-    assert_eq!(out["completed"], false);
-    assert_eq!(out["error"], "fake failure");
+    let (events, last) = run_session_turn(&client, "alpha", "fail please").await;
+    assert_eq!(last["turn"]["state"], "failed");
+    assert_eq!(last["turn"]["error"], "fake failure");
+    assert!(
+        events
+            .iter()
+            .any(|e| e["type"] == "error" && e["fatal"] == true),
+        "{events:?}"
+    );
     client.cancel().await.unwrap();
 }
 
@@ -83,37 +92,10 @@ async fn reports_a_failed_turn_honestly() {
 async fn an_error_event_does_not_fail_a_completed_turn() {
     let h = Harness::new();
     let client = connect(&h).await;
-
-    let result = run_turn(&client, json!({ "prompt": "hiccup" })).await;
-    let out = structured(&result);
-    assert_eq!(out["completed"], true);
-    assert_eq!(out["reply"], "fake reply: hiccup");
-    assert_eq!(out["error"], Value::Null);
-    client.cancel().await.unwrap();
-}
-
-/// A relative working directory is a caller mistake and must be rejected before any agent runs, since its meaning
-/// would depend on wherever the tunnel client happened to start devbox-mcp.
-#[tokio::test]
-async fn rejects_relative_workdir() {
-    let h = Harness::new();
-    let client = connect(&h).await;
-
-    let params = CallToolRequestParams::new("run_turn").with_arguments(
-        json!({ "prompt": "hi", "workdir": "relative/dir" })
-            .as_object()
-            .unwrap()
-            .clone(),
-    );
-    let err = client.call_tool(params).await.unwrap_err();
-    assert!(
-        err.to_string().contains("absolute"),
-        "unexpected error: {err}"
-    );
-    assert!(
-        !h.fake_dir.join("argv").exists(),
-        "agent ran despite invalid workdir"
-    );
+    let (_, last) = run_session_turn(&client, "alpha", "hiccup").await;
+    assert_eq!(last["turn"]["state"], "completed");
+    assert_eq!(last["turn"]["final_message"], "fake reply: hiccup");
+    assert_eq!(last["turn"]["error"], Value::Null);
     client.cancel().await.unwrap();
 }
 
@@ -125,14 +107,14 @@ async fn large_prompt_does_not_deadlock_against_early_output() {
     std::fs::write(h.fake_dir.join("noisy"), "").unwrap();
     let client = connect(&h).await;
 
-    let prompt = "x".repeat(1024 * 1024);
-    let result = tokio::time::timeout(
+    let prompt = "x".repeat(200 * 1024);
+    let (_, last) = tokio::time::timeout(
         Duration::from_secs(20),
-        run_turn(&client, json!({ "prompt": prompt })),
+        run_session_turn(&client, "alpha", &prompt),
     )
     .await
     .expect("turn deadlocked");
-    assert_eq!(structured(&result)["completed"], true);
+    assert_eq!(last["turn"]["state"], "completed");
     assert_eq!(h.recorded("stdin").len(), prompt.len());
     client.cancel().await.unwrap();
 }
@@ -144,13 +126,13 @@ async fn background_leftovers_neither_hang_the_turn_nor_survive_it() {
     let h = Harness::new();
     let client = connect(&h).await;
 
-    let result = tokio::time::timeout(
+    let (_, last) = tokio::time::timeout(
         Duration::from_secs(10),
-        run_turn(&client, json!({ "prompt": "linger" })),
+        run_session_turn(&client, "alpha", "linger"),
     )
     .await
     .expect("turn waited for a background process's pipes");
-    assert_eq!(structured(&result)["completed"], true);
+    assert_eq!(last["turn"]["state"], "completed");
     let lingering: i32 = h.recorded("linger").trim().parse().unwrap();
     assert_all_gone(&[lingering], "background process outlived its turn").await;
     client.cancel().await.unwrap();
@@ -163,13 +145,13 @@ async fn detached_leftovers_do_not_hang_the_turn() {
     let h = Harness::new();
     let client = connect(&h).await;
 
-    let result = tokio::time::timeout(
+    let (_, last) = tokio::time::timeout(
         Duration::from_secs(10),
-        run_turn(&client, json!({ "prompt": "linger-detached" })),
+        run_session_turn(&client, "alpha", "linger-detached"),
     )
     .await
     .expect("turn waited for a detached process's pipes");
-    assert_eq!(structured(&result)["completed"], true);
+    assert_eq!(last["turn"]["state"], "completed");
     let lingering: i32 = h.recorded("linger").trim().parse().unwrap();
     send_signal(lingering as u32, libc::SIGKILL);
     client.cancel().await.unwrap();
@@ -247,14 +229,20 @@ impl RawServer {
         h.hanging_agent_pids().await
     }
 
-    /// Initializes fully and starts a turn with `prompt` as request 2, without waiting for anything.
+    /// Initializes fully, creates session `s` (request 2), and sends it `prompt` (request 3), without waiting for the
+    /// turn.
     async fn start_turn(&mut self, prompt: &str) {
         self.initialize().await;
         self.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
             .await;
         self.send(
             json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
-            "name": "run_turn", "arguments": {"prompt": prompt}}}),
+            "name": "session_create", "arguments": {"name": "s"}}}),
+        )
+        .await;
+        self.send(
+            json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+            "name": "session_send", "arguments": {"name": "s", "message": prompt}}}),
         )
         .await;
     }
@@ -326,33 +314,27 @@ async fn sigterm_during_initialization_shuts_down() {
     server.assert_clean_exit().await;
 }
 
-/// Spec (`LIF-1`): when the client cancels a running call (`notifications/cancelled`), the agent and everything it
-/// started are killed, and devbox-mcp itself keeps serving. rmcp does not drop a cancelled handler by itself, so this
-/// fails if the handler ignores its cancellation token.
+/// Spec (`TRN-1`): an accepted turn belongs to its session, not to the call that started it, so a client cancelling
+/// that call (`notifications/cancelled`) does not stop the agent; only `session_interrupt` or shutdown does.
 #[tokio::test]
-async fn cancelling_a_call_kills_its_agent() {
+async fn cancelling_the_send_call_leaves_the_turn_running() {
     let h = Harness::new();
     let mut server = RawServer::start(&h);
     let pids = server.start_hanging_turn(&h).await;
     server
         .send(
             json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
-            "params": {"requestId": 2, "reason": "test"}}),
+            "params": {"requestId": 3, "reason": "test"}}),
         )
         .await;
-    assert_all_gone(&pids, "agent survived its call being cancelled").await;
-
-    server
-        .send(json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}))
-        .await;
-    // Skip anything devbox-mcp sends about the cancelled call; what matters is that it still answers.
-    loop {
-        if server.recv().await["id"] == 3 {
-            break;
-        }
-    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        pids.iter().all(|&p| support::process_running(p)),
+        "the agent stopped when its send call was cancelled"
+    );
     server.close_stdin();
     server.assert_clean_exit().await;
+    assert_all_gone(&pids, "agent survived devbox-mcp shutting down").await;
 }
 
 /// Reads a file of whitespace-separated PIDs the fake agent wrote, or nothing if it does not exist.

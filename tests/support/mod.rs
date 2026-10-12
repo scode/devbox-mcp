@@ -23,6 +23,7 @@ use tempfile::TempDir;
 /// It records its argv, stdin, working directory, and parent PID (which is devbox-mcp's) next to itself, so tests can
 /// check exactly how devbox-mcp invoked it. Prompts select the behavior:
 ///
+/// - `fail-long...`: a failed turn whose reason is 5000 bytes, longer than devbox-mcp keeps.
 /// - `fail...`: a failed turn.
 /// - `hang...`: never finishes. Like real Codex running a shell command, it first starts a shell in a new session (so
 ///   in another process group), and that shell starts a background `sleep`. A cleanup that only kills the agent's
@@ -34,6 +35,7 @@ use tempfile::TempDir;
 ///   `spawned`.
 /// - `hang-nonutf8...`: never finishes. Starts, in a new session, a copy of `sleep` named `worker\xff`, whose
 ///   `/proc/<pid>/stat` is not valid UTF-8. Its PID goes to `odd`.
+/// - `many...`: 60 agent messages before the reply, for paging.
 /// - `hiccup...`: an `error` event, then a normal completion.
 /// - `linger...`: completes normally, but first starts a background `sleep` in its own process group that keeps stdout
 ///   and stderr open after the agent exits. Its PID goes to `linger`.
@@ -55,9 +57,19 @@ fi
 prompt=$(cat)
 printf '%s' "$prompt" > "$dir/stdin"
 pwd > "$dir/cwd"
-echo '{"type":"thread.started","thread_id":"fake-thread-1"}'
+# A resumed turn (`exec resume ... <id> -`) reports the session it was asked to resume, like real Codex.
+if [ "$2" = "resume" ]; then
+  eval "thread=\${$(($# - 1))}"
+else
+  thread=fake-thread-1
+fi
+echo "{\"type\":\"thread.started\",\"thread_id\":\"$thread\"}"
 echo '{"type":"turn.started"}'
 case "$prompt" in
+  fail-long*)
+    echo "{\"type\":\"turn.failed\",\"error\":{\"message\":\"$(head -c 5000 /dev/zero | tr '\0' x)\"}}"
+    exit 1
+    ;;
   fail*)
     echo '{"type":"turn.failed","error":{"message":"fake failure"}}'
     exit 1
@@ -84,6 +96,11 @@ EOS
     setsid sh -c 'sleep 1000 & echo $! > "$1.tmp" && mv "$1.tmp" "$1"; wait' sh "$dir/detached" &
     echo "$$ $!" > "$dir/pids.tmp" && mv "$dir/pids.tmp" "$dir/pids"
     wait
+    ;;
+  many*)
+    for i in $(seq 1 60); do
+      echo "{\"type\":\"item.completed\",\"item\":{\"id\":\"m$i\",\"type\":\"agent_message\",\"text\":\"message $i\"}}"
+    done
     ;;
   hiccup*)
     echo '{"type":"error","message":"fake transient error"}'
@@ -199,19 +216,85 @@ pub async fn call(
     client.call_tool(params).await
 }
 
-/// Calls `run_turn` with the given JSON arguments, failing the test on a protocol-level error.
-pub async fn run_turn(client: &RunningService<RoleClient, ()>, args: Value) -> CallToolResult {
-    let params =
-        CallToolRequestParams::new("run_turn").with_arguments(args.as_object().unwrap().clone());
-    client.call_tool(params).await.unwrap()
-}
-
-/// The structured result of a `run_turn` call.
-pub fn structured(result: &CallToolResult) -> &Value {
+/// The structured content of a tool result.
+pub fn structured(result: &CallToolResult) -> Value {
     result
         .structured_content
-        .as_ref()
-        .expect("run_turn returns structured content")
+        .clone()
+        .expect("the tool returns structured content")
+}
+
+/// The error text of a call that must fail, for checking that errors say what went wrong (`DOC-3`).
+pub fn error_text(result: Result<CallToolResult, rmcp::ServiceError>) -> String {
+    match result {
+        Err(err) => err.to_string(),
+        Ok(result) => panic!("expected an error, got {result:?}"),
+    }
+}
+
+/// Calls `session_read`, failing the test on an error.
+pub async fn read(
+    client: &RunningService<RoleClient, ()>,
+    name: &str,
+    cursor: Option<&str>,
+) -> Value {
+    let mut args = serde_json::json!({ "name": name });
+    if let Some(c) = cursor {
+        args["cursor"] = serde_json::json!(c);
+    }
+    structured(&call(client, "session_read", args).await.unwrap())
+}
+
+/// Polls `session_read` from `cursor` until the most recent turn has ended and no more events are waiting, the way a
+/// caller is meant to, and returns every event seen and the final read.
+pub async fn read_until_ended(
+    client: &RunningService<RoleClient, ()>,
+    name: &str,
+    mut cursor: Option<String>,
+) -> (Vec<Value>, Value) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut events = Vec::new();
+    loop {
+        let result = read(client, name, cursor.as_deref()).await;
+        events.extend(result["events"].as_array().unwrap().iter().cloned());
+        cursor = Some(result["next_cursor"].as_str().unwrap().to_owned());
+        let state = result["turn"]["state"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        let ended = !matches!(state.as_str(), "running" | "interrupting");
+        if ended && result["more"] == false {
+            return (events, result);
+        }
+        assert!(Instant::now() < deadline, "turn never ended: {result}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Runs one turn the way a caller would: creates session `name`, sends `prompt`, and follows the turn to its end.
+/// Returns the events and the final read, whose `turn` has the outcome.
+pub async fn run_session_turn(
+    client: &RunningService<RoleClient, ()>,
+    name: &str,
+    prompt: &str,
+) -> (Vec<Value>, Value) {
+    call(
+        client,
+        "session_create",
+        serde_json::json!({ "name": name }),
+    )
+    .await
+    .unwrap();
+    let sent = structured(
+        &call(
+            client,
+            "session_send",
+            serde_json::json!({ "name": name, "message": prompt }),
+        )
+        .await
+        .unwrap(),
+    );
+    read_until_ended(client, name, sent["cursor"].as_str().map(str::to_owned)).await
 }
 
 /// True if a process with this PID exists and is not a zombie.

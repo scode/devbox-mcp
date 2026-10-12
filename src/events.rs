@@ -8,6 +8,8 @@
 use rmcp::schemars;
 use serde::Serialize;
 
+use crate::store::TurnState;
+
 /// Longest text kept in any one event field, in bytes.
 pub const MAX_TEXT_BYTES: usize = 8 * 1024;
 
@@ -20,6 +22,21 @@ pub const MAX_FILE_CHANGES: usize = 50;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventKind {
+    /// A turn started with this message from the caller.
+    TurnStarted {
+        /// The message that started the turn (cut here to 8 KiB; the agent got all of it).
+        message: String,
+    },
+    /// The turn ended. This is always the turn's last event.
+    TurnEnded {
+        /// How it ended: `completed`, `failed`, or `interrupted`.
+        state: TurnState,
+        /// Why it failed, for a failed turn: at most 4 KiB, ending in ` [cut]` when it was longer.
+        error: Option<String>,
+        /// True when the turn was stopped but devbox-mcp could not confirm that everything the agent had started has
+        /// stopped.
+        cleanup_uncertain: bool,
+    },
     /// A message from the agent, such as an explanation or its final reply.
     AgentMessage {
         /// The message text.
@@ -79,6 +96,23 @@ pub struct FileChangeEntry {
     pub path: String,
     /// What happened to it as the agent reports it, for example `add`, `update`, or `delete`.
     pub kind: String,
+}
+
+// An `EventKind` with its place in the session's stream. The doc comment below is what a calling model reads.
+/// One event in a session: what happened, in `type`, with that kind's own fields, plus where it sits in the session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+pub struct Event {
+    /// Position of this event in the session's event stream; it counts up across turns.
+    pub seq: u64,
+    /// The turn the event belongs to.
+    pub turn_id: u64,
+    /// When devbox-mcp received the event (RFC 3339, UTC).
+    pub time: String,
+    /// True when a field of this event was cut to keep it small: long command output keeps its end, other text its
+    /// beginning, and file changes their first 50 entries.
+    pub truncated: bool,
+    #[serde(flatten)]
+    pub kind: EventKind,
 }
 
 /// An event as an agent produced it, before the session gives it a sequence number and time.
@@ -146,6 +180,7 @@ impl Bounder {
         changes
     }
 
+    /// Wraps the event built from bounded fields, marking it truncated if any of them was cut.
     pub fn finish(self, kind: EventKind) -> AgentEvent {
         AgentEvent {
             kind,

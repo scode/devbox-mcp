@@ -1,6 +1,7 @@
 # devbox-mcp
 
-NOTE: This is an early prototype. It can run a single Codex turn on the box and return the reply, and nothing more yet.
+NOTE: This is an early prototype. It runs Codex sessions on the box, with turns that run in the background and are read
+incrementally, but has no transcripts, no deployment tooling, and only Codex as an agent yet.
 
 devbox-mcp is going to be an [MCP](https://modelcontextprotocol.io/) server that lets remote agents, such as ChatGPT
 Dots, drive coding agents (Codex, and later others) on a Linux box, through the OpenAI Secure MCP Tunnel.
