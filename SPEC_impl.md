@@ -324,9 +324,16 @@ devbox-mcp runs on the box as the user whose files the agents work on, under sys
 profile's MCP command over stdio. Lingering (`loginctl enable-linger`) keeps the service running without a login
 session.
 
-Nothing specific to one deployment is in this repository: no tunnel ID, runtime key, or hostname. They are given at
-setup on the box, by `devbox-mcp setup --tunnel-id <id>`, which reads the runtime key from stdin (never from the command
-line, where other processes can see it) and does three things:
+Nothing specific to one deployment is in this repository: no tunnel ID, runtime key, or hostname. They are given on the
+box, by two commands. The key has its own, so that it is pasted once per box and again only to replace it, while setup
+can be rerun freely.
+
+`devbox-mcp set-key` reads the runtime key from stdin (never from the command line, where other processes can see it)
+and writes it, as `CONTROL_PLANE_API_KEY=<key>`, to `~/.config/devbox-mcp/tunnel.env`, readable only by the user, which
+the unit loads; the key appears nowhere else. The file is created afresh each time, never written through whatever was
+at its path, so a symlink or hardlink there cannot carry the key into another file.
+
+`devbox-mcp setup --tunnel-id <id>` never touches the key file and does two things:
 
 - runs `tunnel-client init --force --profile devbox --profile-dir ~/.config/tunnel-client --tunnel-id <id> --mcp-command
   "<devbox-mcp> --codex-bin <codex>"`, so tunnel-client writes its own profile and devbox-mcp never writes
@@ -334,22 +341,20 @@ line, where other processes can see it) and does three things:
   `PATH` is minimal and does not include the directories they usually live in. The profile directory is explicit, here
   and in the unit, so an `XDG_CONFIG_HOME` in the shell running setup cannot put the profile where the service does not
   look;
-- writes the runtime key, as `CONTROL_PLANE_API_KEY=<key>`, to `~/.config/devbox-mcp/tunnel.env`, readable only by the
-  user, which the unit loads; the key appears nowhere else;
 - writes the unit, `~/.config/systemd/user/devbox-mcp.service`, from one fixed piece of text with the absolute paths
   filled in, plus `Environment=PATH=` with the `PATH` setup runs with, so that the agents' commands find the user's
   usual tools rather than only those on the systemd user manager's minimal `PATH`. Relative and empty entries (the
   current directory, which a service must not depend on) and entries that would need escaping in a unit file are left
   out; setup reports all but the empty ones.
 
-It then prints the remaining commands (enable lingering, reload, enable and start the service) rather than running them.
-It does not pass on `tunnel-client init`'s own output unless init fails: that output advises running tunnel-client in
-the foreground, which would serve its admin API on the profile's loopback TCP port instead of the unit's socket. The key
-file is created afresh each time, never written through whatever was at its path, so a symlink or hardlink there cannot
-carry the key into another file. Running it again replaces those files, for example to change the tunnel ID. Paths
-containing characters that would need escaping in a unit file or command line (whitespace, quotes, `%`, backslashes) are
-refused rather than escaped. For tests, a flag points it at another home directory and tunnel-client binary. The pinned
-tunnel-client release and devbox-mcp are installed under the user's home first; the deployment guide says how.
+It then prints the remaining commands (set the key if there is no key file yet, enable lingering, reload, enable and
+start the service) rather than running them. It does not pass on `tunnel-client init`'s own output unless init fails:
+that output advises running tunnel-client in the foreground, which would serve its admin API on the profile's loopback
+TCP port instead of the unit's socket. Running it again replaces the profile and the unit, for example to change the
+tunnel ID or the `PATH`. Paths containing characters that would need escaping in a unit file or command line
+(whitespace, quotes, `%`, backslashes) are refused rather than escaped. For tests, a flag points both commands at
+another home directory, and setup at another tunnel-client binary. The pinned tunnel-client release and devbox-mcp are
+installed under the user's home first; the deployment guide says how.
 
 The unit uses:
 

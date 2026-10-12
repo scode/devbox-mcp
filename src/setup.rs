@@ -1,11 +1,13 @@
-//! `devbox-mcp setup`: configures this box to serve devbox-mcp through the OpenAI tunnel, as a systemd user service
-//! (SPEC_impl.md, "Deployment").
+//! `devbox-mcp setup` and `devbox-mcp set-key`: configure this box to serve devbox-mcp through the OpenAI tunnel, as a
+//! systemd user service (SPEC_impl.md, "Deployment").
 //!
 //! Everything specific to one deployment (the tunnel ID and the runtime key) is given here, on the box, so none of it is
-//! in the repository. Setup writes three things and runs nothing else: tunnel-client's profile (by running
-//! `tunnel-client init`, so devbox-mcp never writes tunnel-client's YAML), an environment file holding the key, and the
-//! unit. Enabling and starting the service is left to the user, who gets the commands printed, because those change
-//! what runs on the box from then on.
+//! in the repository. The key has a command of its own, `set-key`, so that it is pasted once per box (and again only to
+//! replace it), while `setup` can be rerun freely, for example after changing the tunnel ID or the PATH. `set-key`
+//! writes an environment file holding the key and nothing else. `setup` writes tunnel-client's profile (by running
+//! `tunnel-client init`, so devbox-mcp never writes tunnel-client's YAML) and the unit, and never touches the key.
+//! Neither runs anything else: enabling and starting the service is left to the user, who gets the commands printed,
+//! because those change what runs on the box from then on.
 //!
 //! Paths go into a unit file and a command line unescaped, so any path that would need escaping is refused instead.
 //! Escaping correctly for both systemd and tunnel-client's command splitting is easy to get subtly wrong, and refusing
@@ -29,7 +31,7 @@ const UNIT_NAME: &str = "devbox-mcp.service";
 #[derive(Debug, clap::Args)]
 pub struct SetupArgs {
     /// The tunnel's ID, as shown on the tunnel management page (`tunnel_` followed by 32 lowercase letters or digits).
-    /// The runtime key is read from stdin, never from the command line, where other processes could see it.
+    /// The tunnel's runtime key is given separately, with `devbox-mcp set-key`.
     #[arg(long)]
     tunnel_id: String,
 
@@ -47,13 +49,51 @@ pub struct SetupArgs {
     home: Option<PathBuf>,
 }
 
-/// Runs setup: validates everything first, so a refused setup has changed nothing, then writes the profile, the key,
-/// and the unit, in that order.
+/// Flags of `devbox-mcp set-key`.
+#[derive(Debug, clap::Args)]
+pub struct SetKeyArgs {
+    /// Write the key in this home directory instead of the current user's. For tests.
+    #[arg(long, hide = true)]
+    home: Option<PathBuf>,
+}
+
+/// The file holding the runtime key, which the unit loads. Only `set_key` writes it.
+fn key_file(home: &Path) -> PathBuf {
+    home.join(".config/devbox-mcp/tunnel.env")
+}
+
+/// The home directory to work in: the hidden `--home` flag's, or the current user's.
+fn home_dir(home: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    match home {
+        Some(home) => Ok(home),
+        None => std::env::home_dir().context("cannot determine home directory"),
+    }
+}
+
+/// Runs set-key: reads the runtime key from stdin, never from the command line, where other processes could see it,
+/// and writes it to the key file, replacing any earlier key.
+pub fn set_key(args: SetKeyArgs) -> anyhow::Result<()> {
+    let home = home_dir(args.home)?;
+    let key = read_key()?;
+    let key_file = key_file(&home);
+    let dir = key_file
+        .parent()
+        .expect("the key file is inside a directory");
+    create_private_dir(dir)?;
+    write_private(&key_file, &format!("CONTROL_PLANE_API_KEY={key}\n"))?;
+    println!(
+        "Wrote the runtime key to {}. If the service is already running, restart it to use the new key:\n\
+         \n\
+         \x20   systemctl --user restart {UNIT_NAME}",
+        key_file.display()
+    );
+    Ok(())
+}
+
+/// Runs setup: validates everything first, so a refused setup has changed nothing, then writes the profile and the
+/// unit, in that order. The key file is left alone; the unit only refers to it.
 pub fn run(args: SetupArgs) -> anyhow::Result<()> {
-    let home = match args.home {
-        Some(home) => home,
-        None => std::env::home_dir().context("cannot determine home directory")?,
-    };
+    let home = home_dir(args.home)?;
     // This binary is what tunnel-client will start, so it must be the installed copy, not a build directory's.
     let devbox_mcp = std::env::current_exe().context("cannot determine devbox-mcp's own path")?;
     let codex = match args.codex_bin {
@@ -66,8 +106,7 @@ pub fn run(args: SetupArgs) -> anyhow::Result<()> {
 
     let config = home.join(".config");
     let profile_dir = config.join("tunnel-client");
-    let env_dir = config.join("devbox-mcp");
-    let env_file = env_dir.join("tunnel.env");
+    let env_file = key_file(&home);
     let unit_dir = config.join("systemd/user");
     for (what, path) in [
         ("devbox-mcp", &devbox_mcp),
@@ -95,8 +134,6 @@ pub fn run(args: SetupArgs) -> anyhow::Result<()> {
         );
     }
 
-    let key = read_key()?;
-
     let mcp_command = format!("{} --codex-bin {}", devbox_mcp.display(), codex.display());
     // init's own stdout is kept from the user: it advises running `tunnel-client run` in the foreground, which would
     // serve the admin API on loopback TCP (the profile's default) instead of the unit's private socket (`SEC-3`). It is
@@ -121,9 +158,6 @@ pub fn run(args: SetupArgs) -> anyhow::Result<()> {
         );
     }
 
-    create_private_dir(&env_dir)?;
-    write_private(&env_file, &format!("CONTROL_PLANE_API_KEY={key}\n"))?;
-
     fs::create_dir_all(&unit_dir)
         .with_context(|| format!("cannot create {}", unit_dir.display()))?;
     let unit = unit_dir.join(UNIT_NAME);
@@ -133,12 +167,23 @@ pub fn run(args: SetupArgs) -> anyhow::Result<()> {
     )
     .with_context(|| format!("cannot write {}", unit.display()))?;
 
+    // Without a key the service would fail to start, so the first step depends on whether one is there yet.
+    let first_step = if env_file.exists() {
+        String::new()
+    } else {
+        "There is no runtime key yet. Give it first, on stdin (see docs/deployment.md):\n\
+         \n\
+         \x20   devbox-mcp set-key\n\
+         \n"
+        .to_owned()
+    };
     println!(
-        "Wrote the tunnel-client profile {PROFILE:?} in {}, the runtime key to {}, and {}.\n\
+        "Wrote the tunnel-client profile {PROFILE:?} in {} and {}.\n\
          \n\
          The agents' commands get this shell's PATH. To change it, run setup again from a shell with the PATH you \
          want.\n\
          \n\
+         {first_step}\
          To start the service, now and at every boot:\n\
          \n\
          \x20   loginctl enable-linger\n\
@@ -150,7 +195,6 @@ pub fn run(args: SetupArgs) -> anyhow::Result<()> {
          \x20   systemctl --user daemon-reload\n\
          \x20   systemctl --user restart {UNIT_NAME}",
         profile_dir.display(),
-        env_file.display(),
         unit.display()
     );
     Ok(())
