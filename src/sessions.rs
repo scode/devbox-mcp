@@ -20,6 +20,7 @@ use tokio::sync::oneshot;
 use crate::codex::{self, Codex, Outcome, Progress, TurnRequest, TurnResult};
 use crate::events::{Event, EventKind, Keep, MAX_TEXT_BYTES, truncate};
 use crate::store::{AcceptedRequest, Agent, Record, Store, TurnRecord, TurnState};
+use crate::transcript::{self, Page};
 
 /// Most sessions one `session_list` call returns (SPEC_impl.md, "Tools").
 pub const LIST_PAGE: usize = 50;
@@ -880,6 +881,60 @@ impl Sessions {
             error_cut,
         );
         session.running = None;
+    }
+
+    /// Reads a page of the agent's own transcript of the session's conversation (SPEC.md `TRA-2`, SPEC_impl.md
+    /// "Tools"). The transcript is found and read on a blocking thread, since it can run to megabytes; the table lock
+    /// is held only to look up the session's conversation ID.
+    pub async fn transcript(
+        &self,
+        name: &str,
+        from: Option<u64>,
+        limit: Option<usize>,
+    ) -> Result<Page, SessionError> {
+        let limit = limit.unwrap_or(transcript::DEFAULT_LIMIT);
+        if !(1..=transcript::MAX_LIMIT).contains(&limit) {
+            return Err(SessionError::Invalid(format!(
+                "limit must be 1 to {}, got {limit}",
+                transcript::MAX_LIMIT
+            )));
+        }
+        let (agent, native_id) = {
+            let table = self.table.lock().unwrap();
+            let session = table.sessions.get(name).ok_or_else(|| not_found(name))?;
+            let record = &session.record;
+            match &record.native_id {
+                Some(id) => (record.agent, id.clone()),
+                None if record.turn.is_none() => {
+                    return Err(SessionError::Invalid(format!(
+                        "session {name:?} has no transcript yet: nothing has been sent to it"
+                    )));
+                }
+                None if session.running.is_some() => {
+                    return Err(SessionError::Invalid(format!(
+                        "session {name:?} has no transcript devbox-mcp can find yet: the agent has not reported its \
+                         conversation ID, which it does as it starts. Follow the turn with session_read and try again \
+                         once it shows the agent's first events"
+                    )));
+                }
+                None => {
+                    return Err(SessionError::Invalid(format!(
+                        "session {name:?} has no transcript devbox-mcp can find: its turn ended before the agent \
+                         reported its conversation ID"
+                    )));
+                }
+            }
+        };
+        let codex = self.config.codex.clone();
+        let read = tokio::task::spawn_blocking(move || {
+            let path = match agent {
+                Agent::Codex => codex.transcript_path(&native_id)?,
+            };
+            transcript::read(&path, from, limit)
+        })
+        .await
+        .map_err(|e| SessionError::Internal(format!("reading the transcript failed: {e}")))?;
+        read.map_err(SessionError::Internal)
     }
 
     /// Removes a session (SPEC.md `SES-6`, SPEC_impl.md "Tools"): deletes the agent's stored data for it, then its

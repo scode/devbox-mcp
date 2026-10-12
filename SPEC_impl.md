@@ -9,11 +9,11 @@ agreement.
 The code is an early prototype that implements steps 1 and 2 of the roadmap in TODO.md. Implemented: the stdio transport
 and the security posture (`SEC-*`, `TSP-1`), `LIF-1` for orderly shutdowns, sessions (`SES-*`) with the Codex adapter, a
 model and effort chosen at creation, and removal, the session store of "Storage", and turns (`TRN-*`) with "Turn
-lifecycle", "Turn events", cursors, request IDs, liveness, and the bounds of `BND-*`, through the six session tools.
+lifecycle", "Turn events", cursors, request IDs, liveness, and the bounds of `BND-*`, through the session tools, and
+`session_transcript` (`TRA-2`) for Codex sessions.
 
-Specified below for steps 3 and 4 of the roadmap but not yet implemented: Claude as a second agent and the
-`session_transcript` tool (`TRA-2`). "Deployment" is implemented by `devbox-mcp setup`;
-[docs/deployment.md](docs/deployment.md) is the guide.
+Specified below for steps 3 and 4 of the roadmap but not yet implemented: Claude as a second agent, including its
+transcripts. "Deployment" is implemented by `devbox-mcp setup`; [docs/deployment.md](docs/deployment.md) is the guide.
 
 ## Language and dependencies
 
@@ -94,8 +94,10 @@ agent's environment variable or else the home directory (`$CODEX_HOME`, else `~/
 `~/.claude`), and uses it only for its own reads (transcripts) and Claude's deletions; it sets nothing on the agents it
 starts. Exporting a resolved default would not be harmless: Claude Code reads its global `.claude.json` from
 `$CLAUDE_CONFIG_DIR` when that is set and from the home directory otherwise, so setting it even to `~/.claude` would
-hide the user's global Claude settings from every agent (contrary to `SEC-4`). Tests stay away from the real directories
-because they start devbox-mcp with a temporary `HOME`.
+hide the user's global Claude settings from every agent (contrary to `SEC-4`). A relative value in either variable makes
+devbox-mcp refuse to start: the agent would resolve it against its own working directory, which differs per session, so
+there would be no one directory to read and delete in. Tests stay away from the real directories because they start
+devbox-mcp with a temporary `HOME`.
 
 ## Storage
 
@@ -196,8 +198,9 @@ as MCP structured content and, for clients that ignore that, as the same JSON as
   - `entry` is the line's JSON value, unchanged except that every string longer than 4 KiB is cut to 4 KiB and ends in
     ` [cut]`. If the entry is still larger than 64 KiB once serialized (a huge array, say), it is replaced by its
     serialized JSON cut to 64 KiB as a string, with `truncated: true`. A line that is not valid JSON is returned as a
-    string, cut the same way. So one entry never exceeds 64 KiB, and a read always returns at least one entry and moves
-    forward.
+    string, cut the same way, and a line longer than 4 MiB is not parsed at all: only its first 64 KiB is read, as a
+    string with `truncated: true`, so one enormous line cannot pull a huge buffer into memory. So one entry never
+    exceeds 64 KiB, and a read always returns at least one entry and moves forward.
   - A read stops adding entries once they total 256 KiB, the newest end first when reading from the end (`BND-1`).
   - The read works on the file as it was when the read started: its length is taken first, and a partial last line (the
     agent is still writing it) is left out.

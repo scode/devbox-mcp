@@ -37,6 +37,9 @@ const CUT_MARK: &str = " [cut]";
 pub struct Codex {
     /// Executable to run. Injected (rather than always `codex` on `PATH`) so tests can substitute a fake agent.
     pub bin: PathBuf,
+    /// Codex's own data directory (`$CODEX_HOME`, else `~/.codex`), resolved the way Codex resolves it, where its
+    /// rollouts are. devbox-mcp only reads it and never passes it on (SPEC_impl.md, "Configuration").
+    pub home: PathBuf,
 }
 
 /// One turn to run.
@@ -86,6 +89,39 @@ pub struct Outcome {
 }
 
 impl Codex {
+    /// Finds the rollout file Codex keeps for a session, its native transcript (SPEC_impl.md, "Codex"): the one
+    /// plain `.jsonl` under `sessions/` whose name ends in `-<native id>.jsonl`.
+    ///
+    /// Only plain rollouts are read. One message covers a rollout that is missing, compressed, or migrated into
+    /// Codex's own database, since devbox-mcp cannot tell those apart and the remedy is the same: ask the agent. Errors
+    /// are worded for the calling model.
+    pub fn transcript_path(&self, native_id: &str) -> Result<PathBuf, String> {
+        let sessions = self.home.join("sessions");
+        let suffix = format!("-{native_id}.jsonl");
+        let found = crate::transcript::find(&sessions, true, &|name| name.ends_with(&suffix))
+            .map_err(|e| {
+                format!(
+                    "could not search {} for the transcript: {e}",
+                    sessions.display()
+                )
+            })?;
+        match found.as_slice() {
+            [one] => Ok(one.clone()),
+            [] => Err(format!(
+                "Codex's transcript for this session was not found: no file ending in {suffix} under {}. Codex may \
+                 have compressed it, moved it into its own database, or deleted it. Asking the agent about its earlier \
+                 work in this session (session_send) still works",
+                sessions.display()
+            )),
+            many => Err(format!(
+                "found {} files that could be this session's transcript under {}, so devbox-mcp cannot tell which \
+                 is right",
+                many.len(),
+                sessions.display()
+            )),
+        }
+    }
+
     /// Deletes Codex's stored data for a session with `codex delete --force <native id>`, for removing a session
     /// (SPEC.md `SES-6`): the rollout file and Codex's database rows, as checked with codex-cli 0.162.1.
     ///
@@ -463,7 +499,8 @@ mod tests {
         let bin = dir.path().join("codex");
         std::fs::write(&bin, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        (dir, Codex { bin })
+        let home = dir.path().join("codex-home");
+        (dir, Codex { bin, home })
     }
 
     /// Removal asks Codex to delete a session by its native ID, and a clean exit is success.

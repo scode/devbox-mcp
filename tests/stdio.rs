@@ -11,7 +11,8 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use support::{
-    DEVBOX_MCP, Harness, assert_all_gone, connect, hermetic_env, run_session_turn, send_signal,
+    DEVBOX_MCP, Harness, assert_all_gone, call_checked, connect, hermetic_env, read_until_ended,
+    run_session_turn, send_signal,
 };
 use tokio::process::Command;
 
@@ -32,7 +33,8 @@ async fn lists_the_tools() {
             "session_list",
             "session_read",
             "session_remove",
-            "session_send"
+            "session_send",
+            "session_transcript"
         ]
     );
     client.cancel().await.unwrap();
@@ -141,6 +143,43 @@ fn undescribed_properties(schema: &Value, path: &str, missing: &mut Vec<String>)
         }
         _ => {}
     }
+}
+
+/// Spec (`DOC-2`): every result matches the output schema its tool declares, including in its optional parts (a turn
+/// before and after it ends, events of several kinds, a turn being interrupted). Clients such as Claude Code reject a result that disagrees with
+/// its schema, while rmcp's test client accepts anything, so without this check such a mismatch shows up only with a
+/// real client: `session_transcript` once declared a field required that its pages leave out. Its own results are
+/// checked in tests/transcript.rs, which can give it a transcript to read.
+#[tokio::test]
+async fn results_match_their_declared_schemas() {
+    let h = Harness::new();
+    let client = connect(&h).await;
+    call_checked(&client, "session_create", json!({ "name": "alpha" })).await;
+    call_checked(&client, "session_list", json!({})).await;
+    let sent = call_checked(
+        &client,
+        "session_send",
+        json!({ "name": "alpha", "message": "hiccup" }),
+    )
+    .await;
+    call_checked(&client, "session_read", json!({ "name": "alpha" })).await;
+    read_until_ended(&client, "alpha", sent["cursor"].as_str().map(str::to_owned)).await;
+    call_checked(&client, "session_read", json!({ "name": "alpha" })).await;
+    call_checked(&client, "session_list", json!({})).await;
+
+    // An interrupt needs a running turn; `hold-start` keeps the fake agent waiting before it does anything, so stopping
+    // it leaves nothing behind to clean up.
+    std::fs::write(h.fake_dir.join("hold-start"), "").unwrap();
+    let sent = call_checked(
+        &client,
+        "session_send",
+        json!({ "name": "alpha", "message": "again" }),
+    )
+    .await;
+    call_checked(&client, "session_interrupt", json!({ "name": "alpha" })).await;
+    read_until_ended(&client, "alpha", sent["cursor"].as_str().map(str::to_owned)).await;
+    call_checked(&client, "session_remove", json!({ "name": "alpha" })).await;
+    client.cancel().await.unwrap();
 }
 
 /// Spec: a turn sends the prompt to the agent in the session's working directory and reports the agent's reply. Also

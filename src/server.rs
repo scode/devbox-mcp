@@ -20,6 +20,7 @@ use crate::sessions::{
     TurnSummary,
 };
 use crate::store::Agent;
+use crate::transcript::Page;
 
 impl From<SessionError> for McpError {
     fn from(err: SessionError) -> Self {
@@ -82,6 +83,18 @@ pub struct SessionReadParams {
     /// Where to continue from: the `cursor` from `session_send` or the `next_cursor` from your previous read. Omit it to
     /// read from the start of the most recent turn.
     pub cursor: Option<String>,
+}
+
+// Arguments of `session_transcript`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SessionTranscriptParams {
+    /// The session whose transcript to read.
+    pub name: String,
+    /// The index of the first entry to read, counting from 0. Omit it to read the last entries, which is usually what
+    /// you want (what happened most recently, or how the session ended).
+    pub from: Option<u64>,
+    /// How many entries to read, 1 to 50; 20 when omitted. A read may return fewer when the entries are large.
+    pub limit: Option<usize>,
 }
 
 // Arguments of `session_remove`.
@@ -226,6 +239,31 @@ impl DevboxServer {
         Ok(Json(self.sessions.interrupt(&params.name)?))
     }
 
+    /// Reads the agent's own transcript of a session (SPEC.md `TRA-2`).
+    #[tool(
+        description = "Read the agent's own transcript of a session: its full record of the conversation (your \
+                       messages, its replies, every command and tool call with its output, and the agent's internal \
+                       bookkeeping), as the agent's own JSON entries, one per line of its transcript file. Use it to \
+                       see exactly what the agent did, beyond the events session_read gives. Without `from` it \
+                       returns the last entries, so what happened most recently comes first to hand; to look further \
+                       back, read again with `from` set to the first returned index minus `limit`, and use \
+                       `next_from` to page forwards. Strings longer than 4 KiB are cut and end in ' [cut]', and an \
+                       entry too large even then comes back as the start of its text with `truncated` set. The format \
+                       of entries is the agent's own and differs between agents. Fails, saying why, when the session \
+                       has no transcript yet or the agent's transcript file cannot be found or read; then ask the \
+                       agent itself with session_send. Reading a very large transcript takes a moment."
+    )]
+    async fn session_transcript(
+        &self,
+        Parameters(params): Parameters<SessionTranscriptParams>,
+    ) -> Result<Json<Page>, McpError> {
+        Ok(Json(
+            self.sessions
+                .transcript(&params.name, params.from, params.limit)
+                .await?,
+        ))
+    }
+
     /// Removes a session (SPEC.md `SES-6`).
     #[tool(
         description = "Remove a session you no longer need: deletes the agent's own stored conversation for it and \
@@ -280,8 +318,8 @@ fn instructions(unix_user: &str) -> String {
          `interrupting` and `more` is false; the agent's reply is the turn's `final_message`. Send follow-ups \
          to the same session. No call ever waits for the agent, so pace your reads (every few seconds at most, \
          or after doing other work), and expect long turns to take minutes. Use session_list to find earlier \
-         sessions, session_interrupt to stop a turn, and session_remove to delete a session you no longer \
-         need.\n\n\
+         sessions, session_transcript to read the agent's own detailed record of a session, session_interrupt to \
+         stop a turn, and session_remove to delete a session you no longer need.\n\n\
          How agents run: as the Unix user {unix_user}, with no sandbox, no approval prompts, and unrestricted \
          network access, so an agent can do whatever that user can do on this box, with that user's files and \
          credentials and the programs on the PATH devbox-mcp was set up with. It works in its session's working \

@@ -11,6 +11,7 @@ mod server;
 mod sessions;
 mod setup;
 mod store;
+mod transcript;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -75,6 +76,31 @@ fn default_state_dir() -> anyhow::Result<PathBuf> {
     Ok(home.join(".local").join("state").join("devbox-mcp"))
 }
 
+/// An agent's own data directory, found the way the agent finds it: the environment variable `var` when set, else
+/// `<home>/<dir>`. devbox-mcp reads these but sets nothing on the agents (SPEC_impl.md, "Configuration").
+///
+/// A relative value is refused. An agent resolves it against its own working directory, which is each session's, so
+/// the agent's data would be in a different place per session, and no single directory devbox-mcp could search or
+/// delete in would be right.
+fn agent_home(var: &str, dir: &str) -> anyhow::Result<PathBuf> {
+    match std::env::var_os(var) {
+        Some(path) if !path.is_empty() => {
+            let path = PathBuf::from(path);
+            if path.is_relative() {
+                bail!(
+                    "{var} is the relative path {}; set it to an absolute path or unset it, since the agent would \
+                     resolve it against each session's working directory",
+                    path.display()
+                );
+            }
+            Ok(path)
+        }
+        _ => Ok(std::env::home_dir()
+            .with_context(|| format!("cannot determine home directory to find {dir}"))?
+            .join(dir)),
+    }
+}
+
 /// How long shutdown waits for the runtime's blocking threads after in-flight work has been dropped.
 ///
 /// The one that matters is rmcp's stdin reader: it sits in a blocking `read` that only returns when stdin closes, so
@@ -115,6 +141,7 @@ fn main() -> anyhow::Result<()> {
             workdir_root,
             codex: codex::Codex {
                 bin: args.codex_bin,
+                home: agent_home("CODEX_HOME", ".codex")?,
             },
         },
     )?);
