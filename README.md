@@ -1,13 +1,25 @@
 # devbox-mcp
 
-NOTE: This is an early prototype. It runs Codex and Claude Code sessions on the box, with turns that run in the
-background and are read incrementally, and lets the caller read each agent's own transcript of a session.
+> [!IMPORTANT]
+> This repository is public, and you are welcome to use it, copy from it, or point your own agent at it. But unless real
+> users show up and ask for it, there will be no release engineering: no releases, no prebuilt binaries, no packages or
+> installers. You build it from source. I may also make breaking changes at any time, without notice or a migration
+> path.
 
-devbox-mcp is going to be an [MCP](https://modelcontextprotocol.io/) server that lets remote agents, such as ChatGPT
-Dots, drive coding agents (Codex and Claude Code) on a Linux box, through the OpenAI Secure MCP Tunnel.
+## What it is
 
-WARNING: Giving an agent access to devbox-mcp is the equivalent of giving it an SSH key to the box. Agents it launches
-run with full access and no permission prompts. See the security model in [SPEC.md](SPEC.md).
+ChatGPT Dots are not currently allowed to SSH into machines, so a Dot cannot work on your developer box the way you
+would. devbox-mcp closes that gap. It is an [MCP](https://modelcontextprotocol.io/) server that runs on the box (an
+Ubuntu machine is what it is developed and tested on) and is reached through the OpenAI Secure MCP Tunnel, so the box
+opens no ports. Through it the Dot starts coding agents on the box (Codex or Claude Code), hands them work in long-lived
+sessions, follows their progress, and reads their transcripts.
+
+The [architecture diagram](https://snippets.scode.org/s/devbox-mcp-architecture/) shows how the pieces fit together and
+which of them come from this repository, from OpenAI's upstream tooling, and from OpenAI's hosted services.
+
+> [!WARNING]
+> Giving an agent access to devbox-mcp is the equivalent of giving it an SSH key to the box. Agents it launches run with
+> full access and no permission prompts. See the security model in [SPEC.md](SPEC.md).
 
 ## Building
 
