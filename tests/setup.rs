@@ -154,6 +154,13 @@ async fn setup_writes_the_profile_and_unit() {
     let command = format!("{devbox_mcp} --codex-bin {}", home.codex.display());
     assert!(profile.contains(&command), "{profile}");
 
+    // Whoever can change the unit can change what the service runs, so what setup creates is private whatever the
+    // umask is, and so is the `.config` that set-key created.
+    assert_eq!(home.mode("systemd"), 0o700);
+    assert_eq!(home.mode("systemd/user"), 0o700);
+    assert_eq!(home.mode("systemd/user/devbox-mcp.service"), 0o600);
+    assert_eq!(home.mode(""), 0o700);
+
     let unit = home.config("systemd/user/devbox-mcp.service");
     let tunnel_client = default_tunnel_client();
     let profile_dir = home.path().join(".config/tunnel-client");
@@ -238,6 +245,11 @@ async fn set_key_replaces_the_key() {
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(home.config(KEY_FILE), "CONTROL_PLANE_API_KEY=second-key\n");
     assert_eq!(home.mode(KEY_FILE), 0o600);
+    // The new key is written beside the old one and renamed over it, so a failed write cannot leave the service without
+    // a key; nothing of that may be left behind.
+    let mut tmp = key_file.into_os_string();
+    tmp.push(".tmp");
+    assert!(!std::path::Path::new(&tmp).exists());
 }
 
 /// Spec (SPEC_impl.md "Deployment"): the service gets the PATH of the shell setup ran in, minus entries a unit cannot

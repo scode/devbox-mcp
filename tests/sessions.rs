@@ -290,6 +290,31 @@ async fn a_second_instance_waits_for_the_first() {
     second.cancel().await.unwrap();
 }
 
+/// Spec (`SEC-1`, SPEC_impl.md "Storage"): session records hold the agents' replies and failure text, which can include
+/// anything an agent saw, so the store keeps them private to the user whatever the umask is: directories 0700, the lock
+/// and records 0600. A regression: they used to take the umask's modes, typically readable by everyone.
+#[tokio::test]
+async fn keeps_session_records_private() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let h = Harness::new();
+    let client = connect(&h).await;
+    call(&client, "session_create", json!({ "name": "alpha" }))
+        .await
+        .unwrap();
+    let mode = |rel: &str| {
+        std::fs::metadata(h.state_dir.join(rel))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    assert_eq!(mode(""), 0o700);
+    assert_eq!(mode("sessions"), 0o700);
+    assert_eq!(mode("lock"), 0o600);
+    assert_eq!(mode("sessions/alpha.json"), 0o600);
+    client.cancel().await.unwrap();
+}
+
 /// Spec (`SES-4`, `BND-1`): listing is paged, so every session is reachable however many there are, and each page is
 /// bounded.
 #[tokio::test]

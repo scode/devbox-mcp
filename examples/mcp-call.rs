@@ -35,6 +35,7 @@ use rmcp::service::{RoleClient, RunningService};
 use rmcp::transport::TokioChildProcess;
 use serde_json::{Value, json};
 use tokio::process::Command;
+use tokio::signal::unix::{SignalKind, signal};
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -176,29 +177,42 @@ async fn main() -> anyhow::Result<()> {
         println!("{}", serde_json::to_string_pretty(&tools)?);
     }
 
-    let mut failed = false;
-    for (tool, arguments) in calls {
-        if tool == "wait_turn" {
-            let printed = wait_turn(&client, arguments).await;
-            failed |= printed.get("error").is_some();
+    // A signal ends the run by returning from main, so the drops above stop the proxy, devbox-mcp, and the agent it
+    // runs. With the default action they would be skipped, and in tunnel mode, where devbox-mcp is tunnel-client's child
+    // rather than this process's, everything would keep running.
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let work = async {
+        let mut failed = false;
+        for (tool, arguments) in calls {
+            if tool == "wait_turn" {
+                let printed = wait_turn(&client, arguments).await;
+                failed |= printed.get("error").is_some();
+                println!("{}", serde_json::to_string_pretty(&printed)?);
+                continue;
+            }
+            let result = client
+                .call_tool(CallToolRequestParams::new(tool.clone()).with_arguments(arguments))
+                .await;
+            let printed = match result {
+                Ok(result) => {
+                    failed |= result.is_error == Some(true);
+                    json!({ "tool": tool, "result": result })
+                }
+                Err(err) => {
+                    failed = true;
+                    json!({ "tool": tool, "error": err.to_string() })
+                }
+            };
             println!("{}", serde_json::to_string_pretty(&printed)?);
-            continue;
         }
-        let result = client
-            .call_tool(CallToolRequestParams::new(tool.clone()).with_arguments(arguments))
-            .await;
-        let printed = match result {
-            Ok(result) => {
-                failed |= result.is_error == Some(true);
-                json!({ "tool": tool, "result": result })
-            }
-            Err(err) => {
-                failed = true;
-                json!({ "tool": tool, "error": err.to_string() })
-            }
-        };
-        println!("{}", serde_json::to_string_pretty(&printed)?);
-    }
+        anyhow::Ok(failed)
+    };
+    let failed = tokio::select! {
+        result = work => result?,
+        _ = sigterm.recv() => bail!("stopped by SIGTERM; shutting down the server"),
+        _ = sigint.recv() => bail!("stopped by SIGINT; shutting down the server"),
+    };
 
     client.cancel().await?;
     if failed {
