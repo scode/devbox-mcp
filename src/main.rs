@@ -7,6 +7,7 @@
 mod claude;
 mod codex;
 mod events;
+mod perms;
 mod process;
 mod server;
 mod sessions;

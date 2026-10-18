@@ -137,20 +137,28 @@ impl Store {
     /// Blocking: call it before the async runtime starts.
     pub fn open(state_dir: &Path) -> anyhow::Result<Self> {
         let sessions_dir = state_dir.join("sessions");
-        // Records hold agents' replies and failure text, which can include anything the agent saw, so whatever this
-        // creates is private to the user whatever the umask is. Directories that already exist keep their modes.
+        // Records hold agents' replies and failure text, which can include anything the agent saw, so the state
+        // directory is private to the user whatever the umask is, and so is one left loose from before (`perms`).
         fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(&sessions_dir)
             .with_context(|| format!("cannot create state directory {}", sessions_dir.display()))?;
+        crate::perms::tighten_dir(state_dir)?;
+        crate::perms::tighten_dir(&sessions_dir)?;
+        crate::perms::warn_loose_ancestors(state_dir);
         let lock_path = state_dir.join("lock");
+        // Not following a symbolic link at the lock path matters since the lock is tightened below: a link planted while
+        // the state directory was open to others would otherwise aim that chmod at some other file of the user.
         let lock = File::options()
             .create(true)
             .append(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&lock_path)
             .with_context(|| format!("cannot open {}", lock_path.display()))?;
+        crate::perms::tighten_open_file(&lock)
+            .with_context(|| format!("cannot make {} private (mode 0600)", lock_path.display()))?;
         let deadline = Instant::now() + LOCK_WAIT;
         loop {
             // SAFETY: flock only reads the file descriptor, which `lock` keeps open.
@@ -219,6 +227,14 @@ impl Store {
             else {
                 continue;
             };
+            // A record written before records were created private keeps its old mode until its next write; tighten it
+            // now. A failure only costs a warning: the private state directory already keeps it from others.
+            if let Err(e) = crate::perms::tighten_file_nofollow(&path) {
+                eprintln!(
+                    "devbox-mcp: warning: cannot make session record {} private: {e}",
+                    path.display()
+                );
+            }
             let parsed = fs::read(&path)
                 .map_err(anyhow::Error::from)
                 .and_then(|bytes| Ok(serde_json::from_slice::<Record>(&bytes)?))

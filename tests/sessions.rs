@@ -315,6 +315,103 @@ async fn keeps_session_records_private() {
     client.cancel().await.unwrap();
 }
 
+/// Spec (SPEC_impl.md "Storage"): state written before devbox-mcp made it private, or loosened by hand, is made private
+/// again when devbox-mcp starts (directories 0700, the lock and records 0600), and a loose directory above it that the
+/// user owns is warned about rather than changed, since other programs share it. The live deployment this was written
+/// for had its state directories at 775 and its records at 664.
+#[tokio::test]
+async fn tightens_loose_state_at_start() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let h = Harness::new();
+    let client = connect(&h).await;
+    call(&client, "session_create", json!({ "name": "alpha" }))
+        .await
+        .unwrap();
+    client.cancel().await.unwrap();
+
+    let set = |path: &std::path::Path, mode: u32| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+    };
+    set(h.tmp.path(), 0o775);
+    set(&h.state_dir, 0o775);
+    set(&h.state_dir.join("sessions"), 0o775);
+    set(&h.state_dir.join("lock"), 0o664);
+    set(&h.state_dir.join("sessions/alpha.json"), 0o664);
+
+    // With stdin closed devbox-mcp starts, finds nobody to talk to, and exits; the tightening happens at startup.
+    let output = tokio::time::timeout(
+        Duration::from_secs(20),
+        tokio::process::Command::new(support::DEVBOX_MCP)
+            .env_clear()
+            .envs(support::hermetic_env(h.tmp.path()))
+            .args(h.devbox_args())
+            .stdin(std::process::Stdio::null())
+            .output(),
+    )
+    .await
+    .expect("devbox-mcp did not exit")
+    .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mode = |rel: &str| {
+        std::fs::metadata(h.state_dir.join(rel))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    assert_eq!(mode(""), 0o700, "{stderr}");
+    assert_eq!(mode("sessions"), 0o700);
+    assert_eq!(mode("lock"), 0o600);
+    assert_eq!(mode("sessions/alpha.json"), 0o600);
+    assert!(
+        stderr.contains(&format!(
+            "warning: {} is writable by other users",
+            h.tmp.path().display()
+        )),
+        "{stderr}"
+    );
+    set(h.tmp.path(), 0o700);
+
+    // The session survives the restart.
+    let client = connect(&h).await;
+    let listed = call(&client, "session_list", json!({})).await.unwrap();
+    assert_eq!(support::structured(&listed)["sessions"][0]["name"], "alpha");
+    client.cancel().await.unwrap();
+}
+
+/// Spec (SPEC_impl.md "Storage"): a symbolic link at the lock path, which someone could have planted while the state
+/// directory was open to others, makes devbox-mcp refuse to start instead of following it: the lock is tightened at
+/// start, so following the link would change the mode of whatever file it points to. A review reproduced exactly that
+/// (an unrelated 0755 file became 0600) before the lock was opened without following links.
+#[tokio::test]
+async fn refuses_a_symlinked_lock() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let h = Harness::new();
+    std::fs::create_dir_all(h.state_dir.join("sessions")).unwrap();
+    let target = h.tmp.path().join("unrelated");
+    std::fs::write(&target, "x").unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink(&target, h.state_dir.join("lock")).unwrap();
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(20),
+        tokio::process::Command::new(support::DEVBOX_MCP)
+            .env_clear()
+            .envs(support::hermetic_env(h.tmp.path()))
+            .args(h.devbox_args())
+            .stdin(std::process::Stdio::null())
+            .output(),
+    )
+    .await
+    .expect("devbox-mcp did not exit")
+    .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("lock"), "{stderr}");
+    let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o755, "the link target was changed");
+}
+
 /// Spec (`SES-4`, `BND-1`): listing is paged, so every session is reachable however many there are, and each page is
 /// bounded.
 #[tokio::test]
