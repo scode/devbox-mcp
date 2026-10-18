@@ -365,7 +365,10 @@ impl ClaudeTurn {
 
     fn finish(self, ended: Ended) -> Outcome {
         let cleanup_confirmed = match ended {
-            Ended::Stopped { cleanup_confirmed } => cleanup_confirmed,
+            Ended::Stopped { cleanup_confirmed }
+            | Ended::Failed {
+                cleanup_confirmed, ..
+            } => cleanup_confirmed,
             Ended::Exited { .. } => true,
         };
         let final_message = self
@@ -376,6 +379,7 @@ impl ClaudeTurn {
         let result = match (ended, self.abort_reason) {
             (_, Some(reason)) => TurnResult::Failed { error: reason },
             (Ended::Stopped { .. }, None) => TurnResult::Interrupted,
+            (Ended::Failed { error, .. }, None) => TurnResult::Failed { error },
             (Ended::Exited { status, stderr }, None) => match self.result {
                 Some((false, _)) if status.success() => TurnResult::Completed,
                 Some((true, text)) => TurnResult::Failed { error: text },
@@ -604,6 +608,20 @@ mod tests {
     /// fails it with stderr.
     #[test]
     fn reports_failures() {
+        // A run that failed after Claude started is a failed turn that keeps the cleanup result (`LIF-2`).
+        let (_, turn) = feed("abc", &[]);
+        let outcome = turn.finish(Ended::Failed {
+            error: "failed to read agent output".into(),
+            cleanup_confirmed: false,
+        });
+        assert_eq!(
+            outcome.result,
+            TurnResult::Failed {
+                error: "failed to read agent output".into()
+            }
+        );
+        assert!(!outcome.cleanup_confirmed);
+
         let (_, turn) = feed(
             "abc",
             &[

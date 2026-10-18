@@ -343,6 +343,15 @@ pub enum Ended {
     /// killed and the agent reaped. `cleanup_confirmed` is false when the tree walk could not confirm that everything
     /// stopped (see [`kill_tree`]).
     Stopped { cleanup_confirmed: bool },
+    /// The run failed after the agent had started (its output could not be read, its exit could not be watched, or it
+    /// could not be reaped). Whatever could be cleaned up was, as for a stop, and `cleanup_confirmed` says whether that
+    /// could be confirmed: a failure must not be reported as a clean end when the agent's processes may still run
+    /// (`LIF-2`). An earlier version returned these as plain errors, which lost the cleanup result.
+    Failed {
+        /// What went wrong, for the turn's failure reason.
+        error: String,
+        cleanup_confirmed: bool,
+    },
 }
 
 /// Runs one contained agent process to its end, passing each line of its stdout to `on_line` as it arrives.
@@ -357,6 +366,10 @@ pub enum Ended {
 ///
 /// If this future is dropped before it finishes (devbox-mcp shutting down), the guard kills the agent's tree as it is
 /// dropped (`LIF-1`).
+///
+/// An `Err` means the agent was never started (it could not be spawned), so nothing of it can be running. Every failure
+/// after it started is returned as [`Ended::Failed`] instead, with the cleanup result, so callers can never mistake an
+/// unconfirmed cleanup for a confirmed one.
 pub async fn run_agent(
     command: AgentCommand,
     mut on_line: impl FnMut(&str) -> ControlFlow<()>,
@@ -374,13 +387,12 @@ pub async fn run_agent(
         .spawn()
         .with_context(|| format!("failed to start {}", command.program.display()))?;
     let mut guard = TreeGuard::new(child.id());
-    let pid = child
-        .id()
-        .context("agent exited before it could be tracked")?;
+    // A freshly spawned child has a PID and the pipes requested above until someone reaps or takes them; nothing has.
+    let pid = child.id().expect("a just-spawned child has a PID");
 
-    let stderr = child.stderr.take().context("child stderr missing")?;
+    let stderr = child.stderr.take().expect("stderr is piped");
     let mut stderr_task = AbortOnDrop(tokio::spawn(read_bounded(stderr, MAX_STDERR_BYTES)));
-    let mut stdin = child.stdin.take().context("child stdin missing")?;
+    let mut stdin = child.stdin.take().expect("stdin is piped");
     let input = command.stdin;
     // A write error here means the agent exited without reading its input; that shows up in how the run ends.
     let _stdin_task = AbortOnDrop(tokio::spawn(async move {
@@ -388,7 +400,7 @@ pub async fn run_agent(
         // Dropping stdin closes it, which tells the agent its input is complete.
     }));
 
-    let mut lines = BufReader::new(child.stdout.take().context("child stdout missing")?).lines();
+    let mut lines = BufReader::new(child.stdout.take().expect("stdout is piped")).lines();
     // Watch for the agent's exit without reaping it, so its PID and process group still belong to it while the guard
     // cleans up; reaping happens only afterwards.
     let exited = exited(pid);
@@ -397,49 +409,91 @@ pub async fn run_agent(
     enum Next {
         Exit(std::io::Result<()>),
         Stop,
+        /// Reading the agent's output failed (for example it was not valid UTF-8). The agent may still be running, so
+        /// this ends the run the way a stop does, and the error becomes the run's failure.
+        ReadFailed(std::io::Error),
     }
     let mut stdout_open = true;
     let next = loop {
         tokio::select! {
-            line = lines.next_line(), if stdout_open => match line.context("failed to read agent output")? {
-                Some(line) => {
+            line = lines.next_line(), if stdout_open => match line {
+                Ok(Some(line)) => {
                     if on_line(&line).is_break() {
                         break Next::Stop;
                     }
                 }
                 // The agent closed stdout, but it may keep running: keep watching for its exit and for interrupts.
-                None => stdout_open = false,
+                Ok(None) => stdout_open = false,
+                Err(err) => break Next::ReadFailed(err),
             },
             result = &mut exited => break Next::Exit(result),
             () = &mut interrupt => break Next::Stop,
         }
     };
 
-    let ended = match next {
-        Next::Stop => {
+    // From here on every failure is an `Ended::Failed` that carries what is known about cleanup.
+    let failed = |error: anyhow::Error, cleanup_confirmed| Ended::Failed {
+        error: format!("{error:#}"),
+        cleanup_confirmed,
+    };
+    let (ended, read_failure) = match next {
+        Next::Stop | Next::ReadFailed(_) => {
+            let read_failure = match next {
+                Next::ReadFailed(err) => Some(err),
+                _ => None,
+            };
             // The child goes to the cleanup thread together with the guard. If it stayed here and this future were
             // dropped mid-cleanup, `kill_on_drop` would kill the root before the tree walk had found its descendants,
             // and the child could be reaped while the guard still signals its PID.
-            let (mut child, cleanup_confirmed) = tokio::task::spawn_blocking(move || {
+            let cleanup = tokio::task::spawn_blocking(move || {
                 let confirmed = guard.kill();
                 (child, confirmed)
             })
-            .await
-            .context("process cleanup task failed")?;
-            child.wait().await.context("failed to reap agent")?;
-            Ended::Stopped { cleanup_confirmed }
+            .await;
+            let (mut child, cleanup_confirmed) = match cleanup {
+                Ok(cleaned) => cleaned,
+                // The cleanup thread died, taking the guard and the child with it; nothing is known about the tree.
+                Err(err) => {
+                    return Ok(failed(
+                        anyhow::Error::new(err).context("process cleanup task failed"),
+                        false,
+                    ));
+                }
+            };
+            if let Err(err) = child.wait().await {
+                return Ok(failed(
+                    anyhow::Error::new(err).context("failed to reap agent"),
+                    cleanup_confirmed,
+                ));
+            }
+            (Ended::Stopped { cleanup_confirmed }, read_failure)
         }
         Next::Exit(Err(err)) => {
-            // Without a confirmed unreaped exit, the PID may no longer be the agent's, so it must not be signalled.
+            // Without a confirmed unreaped exit, the PID may no longer be the agent's, so it must not be signalled, and
+            // nothing it started can be confirmed stopped.
             guard.disarm();
-            return Err(err).context("failed to wait for agent");
+            return Ok(failed(
+                anyhow::Error::new(err).context("failed to wait for agent"),
+                false,
+            ));
         }
         Next::Exit(Ok(())) => {
             guard.exited();
-            let status = child.wait().await.context("failed to reap agent")?;
-            Ended::Exited {
-                status,
-                stderr: String::new(),
+            match child.wait().await {
+                Ok(status) => (
+                    Ended::Exited {
+                        status,
+                        stderr: String::new(),
+                    },
+                    None,
+                ),
+                // The group was already cleaned up, as for any exit; only the status is lost.
+                Err(err) => {
+                    return Ok(failed(
+                        anyhow::Error::new(err).context("failed to reap agent"),
+                        true,
+                    ));
+                }
             }
         }
     };
@@ -448,19 +502,41 @@ pub async fn run_agent(
     // output written just before an exit or an interrupt is not lost. Only briefly, though: a background process it
     // started in another session may still hold the pipes open. Both pipes share one deadline so such a leftover delays
     // the result by at most PIPE_DRAIN_TIMEOUT.
+    //
+    // A read error here fails the run just as one before the exit does. Whether the agent's exit or its unreadable
+    // line is noticed first is a matter of scheduling, so treating the two differently would make the same output
+    // complete one turn and fail another. The cleanup result is already known: confirmed after an exit (its group was
+    // killed), or whatever the stop found. After a read failure in the loop there is nothing left to drain: the reader
+    // is in an error state.
     let deadline = tokio::time::Instant::now() + PIPE_DRAIN_TIMEOUT;
-    let drain = async {
-        while let Some(line) = lines.next_line().await? {
-            // The agent is gone, so a stop request has nothing left to stop.
-            let _ = on_line(&line);
+    let read_failure = match read_failure {
+        Some(err) => Some(err),
+        None => {
+            let drain = async {
+                loop {
+                    match lines.next_line().await {
+                        // The agent is gone, so a stop request has nothing left to stop.
+                        Ok(Some(line)) => {
+                            let _ = on_line(&line);
+                        }
+                        Ok(None) => return None,
+                        Err(err) => return Some(err),
+                    }
+                }
+            };
+            tokio::time::timeout_at(deadline, drain)
+                .await
+                .ok()
+                .flatten()
         }
-        anyhow::Ok(())
     };
-    if let Ok(result) = tokio::time::timeout_at(deadline, drain).await {
-        result.context("failed to read agent output")?;
-    }
-    Ok(match ended {
-        Ended::Exited { status, .. } => Ended::Exited {
+    let read_failed = |err| anyhow::Error::new(err).context("failed to read agent output");
+    Ok(match (ended, read_failure) {
+        (Ended::Stopped { cleanup_confirmed }, Some(err)) => {
+            failed(read_failed(err), cleanup_confirmed)
+        }
+        (Ended::Exited { .. }, Some(err)) => failed(read_failed(err), true),
+        (Ended::Exited { status, .. }, None) => Ended::Exited {
             status,
             stderr: tokio::time::timeout_at(deadline, &mut stderr_task.0)
                 .await
@@ -468,7 +544,7 @@ pub async fn run_agent(
                 .and_then(Result::ok)
                 .unwrap_or_default(),
         },
-        stopped => stopped,
+        (other, _) => other,
     })
 }
 
@@ -637,6 +713,133 @@ mod tests {
         .unwrap();
         assert!(matches!(ended, Ended::Stopped { .. }), "{ended:?}");
         assert_eq!(lines.len(), 100);
+    }
+
+    /// Reading the agent's output can fail while it runs (here: a line that is not UTF-8). The run must then clean up
+    /// as a stop does and report a failure, not leave cleanup to a drop that throws the result away; the agent's
+    /// background process is gone afterwards and the cleanup is confirmed.
+    #[tokio::test]
+    async fn a_read_failure_cleans_up_and_fails() {
+        let command = AgentCommand {
+            program: PathBuf::from("/bin/sh"),
+            args: vec![
+                "-c".into(),
+                "sleep 1000 & echo $!; printf 'bad \\377\\n'; wait".into(),
+            ],
+            cwd: PathBuf::from("/"),
+            stdin: Vec::new(),
+        };
+        let mut lines = Vec::new();
+        let ended = run_agent(
+            command,
+            |line| {
+                lines.push(line.to_owned());
+                ControlFlow::Continue(())
+            },
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
+        let Ended::Failed {
+            error,
+            cleanup_confirmed,
+        } = ended
+        else {
+            panic!("{ended:?}");
+        };
+        assert!(error.contains("failed to read agent output"), "{error}");
+        assert!(cleanup_confirmed);
+        let sleep_pid: i32 = lines[0].parse().unwrap();
+        // SIGKILL takes effect asynchronously, so give it a moment, as the interrupt test does.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while is_running(sleep_pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!is_running(sleep_pid), "background process survived");
+    }
+
+    /// An unreadable line fails the run even when the agent has already exited by the time it is read. Whether the exit
+    /// or the line is noticed first is down to scheduling, so a review caught an earlier version that completed the
+    /// turn in one order and failed it in the other.
+    #[tokio::test]
+    async fn a_read_failure_at_exit_still_fails() {
+        let command = AgentCommand {
+            program: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), "printf 'ok\\n\\377\\n'; exit 0".into()],
+            cwd: PathBuf::from("/"),
+            stdin: Vec::new(),
+        };
+        for _ in 0..20 {
+            let ended = run_agent(
+                command.clone(),
+                |_| ControlFlow::Continue(()),
+                std::future::pending(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(
+                    ended,
+                    Ended::Failed {
+                        cleanup_confirmed: true,
+                        ..
+                    }
+                ),
+                "{ended:?}"
+            );
+        }
+    }
+
+    /// The case two reviewers reproduced (`LIF-2`): when the cleanup cannot be confirmed (here the agent's process
+    /// chain is deeper than the walk goes), a read failure must say so. Before, the error was returned bare and the turn
+    /// claimed a confirmed cleanup while descendants could still be running.
+    #[tokio::test]
+    async fn a_read_failure_reports_unconfirmed_cleanup() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let chain = dir.path().join("chain");
+        // Each level starts the next and waits for it, so the chain stays intact until it is killed. The deepest level
+        // creates the marker, so the agent can tell the whole chain exists before it prints the bad line.
+        std::fs::write(
+            &chain,
+            "#!/bin/sh\nif [ \"$1\" -gt 0 ]; then \"$0\" $(($1 - 1)) \"$2\" & wait; else touch \"$2\"; sleep 1000; fi\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&chain, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let depth = MAX_GENERATIONS + 6;
+        let marker = dir.path().join("deepest");
+        let script = format!(
+            "{chain} {depth} {marker} & while [ ! -e {marker} ]; do sleep 0.05; done; printf 'bad \\377\\n'; wait",
+            chain = chain.display(),
+            marker = marker.display()
+        );
+        let command = AgentCommand {
+            program: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), script.into()],
+            cwd: PathBuf::from("/"),
+            stdin: Vec::new(),
+        };
+        let ended = tokio::time::timeout(
+            Duration::from_secs(60),
+            run_agent(
+                command,
+                |_| ControlFlow::Continue(()),
+                std::future::pending(),
+            ),
+        )
+        .await
+        .expect("run did not end")
+        .unwrap();
+        assert!(
+            matches!(
+                ended,
+                Ended::Failed {
+                    cleanup_confirmed: false,
+                    ..
+                }
+            ),
+            "{ended:?}"
+        );
     }
 
     /// An agent that exits on its own is reported with its exit status and stderr.

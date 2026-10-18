@@ -277,7 +277,10 @@ makes the turn `interrupted`, even if the agent was finishing at the same moment
 decides, by the same rule as the prototype: `completed` only if the agent reported completion, did not report failure,
 and exited successfully; `failed` in every other case, including an agent that could not be started, with the reason
 recorded. If the process-tree walk hit its bounds (a process that did not stop in time, or the generation limit),
-cleanup cannot be confirmed, and the terminal state carries `cleanup_uncertain: true` (`TRN-4`, `LIF-2`).
+cleanup cannot be confirmed, and the terminal state carries `cleanup_uncertain: true` (`TRN-4`, `LIF-2`). A failure
+after the agent started (its output cannot be read, its exit cannot be watched, or it cannot be reaped) is cleaned up
+the same way as an interrupt before the turn ends `failed`, and carries the same flag: `cleanup_uncertain` is false only
+when the cleanup was confirmed, or when the agent never started.
 
 The turn ends only once all of this is settled: the agent exited or was killed and reaped, its output pipes were drained
 (at most two seconds after its exit), the `turn_ended` event was published, and the record was written. Until then the

@@ -130,6 +130,19 @@ impl Codex {
         let (status, stderr) = match ended {
             Ended::Exited { status, .. } if status.success() => return Ok(()),
             Ended::Exited { status, stderr } => (status, stderr),
+            Ended::Failed {
+                error,
+                cleanup_confirmed,
+            } => {
+                return Err(format!(
+                    "codex delete failed: {error}{}",
+                    if cleanup_confirmed {
+                        ""
+                    } else {
+                        "; not everything it started could be confirmed stopped"
+                    }
+                ));
+            }
             Ended::Stopped { cleanup_confirmed } => {
                 return Err(format!(
                     "codex delete did not finish within {} seconds and was stopped{}",
@@ -396,12 +409,16 @@ impl CodexTurn {
 
     fn finish(self, ended: Ended) -> Outcome {
         let cleanup_confirmed = match ended {
-            Ended::Stopped { cleanup_confirmed } => cleanup_confirmed,
+            Ended::Stopped { cleanup_confirmed }
+            | Ended::Failed {
+                cleanup_confirmed, ..
+            } => cleanup_confirmed,
             Ended::Exited { .. } => true,
         };
         let result = match (ended, self.abort_reason) {
             (_, Some(reason)) => TurnResult::Failed { error: reason },
             (Ended::Stopped { .. }, None) => TurnResult::Interrupted,
+            (Ended::Failed { error, .. }, None) => TurnResult::Failed { error },
             (Ended::Exited { status, stderr }, None) => {
                 if self.saw_turn_completed && self.turn_failure.is_none() && status.success() {
                     TurnResult::Completed
@@ -743,6 +760,20 @@ mod tests {
             cleanup_confirmed: false,
         });
         assert_eq!(outcome.result, TurnResult::Interrupted);
+        assert!(!outcome.cleanup_confirmed);
+
+        // A run that failed after the agent started is a failed turn that keeps the cleanup result (`LIF-2`).
+        let (_, _, turn) = feed(None, &[]);
+        let outcome = turn.finish(Ended::Failed {
+            error: "failed to read agent output".to_owned(),
+            cleanup_confirmed: false,
+        });
+        assert_eq!(
+            outcome.result,
+            TurnResult::Failed {
+                error: "failed to read agent output".to_owned()
+            }
+        );
         assert!(!outcome.cleanup_confirmed);
 
         // An aborted turn is reported as failed, but uncertain cleanup must survive that classification.
