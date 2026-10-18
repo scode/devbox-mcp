@@ -946,6 +946,8 @@ impl Sessions {
             return;
         };
         let (state, error, final_message, cleanup_uncertain) = match outcome {
+            // An error means the agent never started (`process::run_agent` reports every failure after the start as an
+            // outcome carrying the cleanup result), so there is nothing whose cleanup could be uncertain.
             Err(e) => (TurnState::Failed, Some(format!("{e:#}")), None, false),
             Ok(outcome) => {
                 let (state, error) = match outcome.result {
