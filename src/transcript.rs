@@ -67,7 +67,8 @@ pub struct Page {
     /// How many complete entries the transcript had when the read started.
     pub total: u64,
     /// The index to pass as `from` to continue forwards, when entries follow the last one returned; null otherwise.
-    /// To read further back, pass `from` as the first returned index minus `limit`.
+    /// To read further back, pass `from` as the first index you already have minus `limit` (never below 0), and follow
+    /// `next_from` from there until you reach entries you already have, since a page can hold fewer than `limit`.
     pub next_from: Option<u64>,
 }
 
@@ -92,7 +93,10 @@ pub fn find(
         };
         for entry in entries {
             let entry = entry?;
-            if entry.file_name().to_str().is_some_and(matches) {
+            // Linux names need not be UTF-8. Matching on a lossy conversion keeps such a name visible: the IDs callers
+            // look for are ASCII, so they survive it, and skipping the name would let a search miss a file it was
+            // asked to find (a removal would then report data deleted that is still there).
+            if matches(&entry.file_name().to_string_lossy()) {
                 found.push(entry.path());
             }
             if recursive && entry.file_type()?.is_dir() {
@@ -506,6 +510,16 @@ mod tests {
         std::fs::write(dir.path().join("y-id1.jsonl"), "").unwrap();
         let ends = |n: &str| n.ends_with("-id1.jsonl");
         assert_eq!(find(dir.path(), true, &ends).unwrap().len(), 2);
+        // A name that is not valid UTF-8 but contains the ID is still found.
+        use std::os::unix::ffi::OsStrExt as _;
+        let odd = std::ffi::OsStr::from_bytes(b"z-id1-\xff");
+        std::fs::write(dir.path().join("a").join(odd), "").unwrap();
+        assert_eq!(
+            find(dir.path(), true, &|n: &str| n.contains("id1"))
+                .unwrap()
+                .len(),
+            3
+        );
         assert_eq!(find(dir.path(), false, &ends).unwrap().len(), 1);
         assert!(
             find(&dir.path().join("missing"), true, &ends)

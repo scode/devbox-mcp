@@ -113,11 +113,14 @@ Each session is one JSON file, `<state-dir>/sessions/<name>.json`. It holds:
   legitimate retries after an upgrade.)
 
 Every change rewrites the whole record synchronously: write a temporary file with a fixed name next to it, `fsync` it,
-and rename it over the record. The runtime is single-threaded and a write has no `.await` in it, so two writes can never
-interleave and no further coordination is needed. A send is accepted only once its record (the new turn in state
-`running` and its request ID) is on disk, before the agent is started and before the send returns; if that write fails,
-the send fails and nothing runs. If a later write fails, the call or turn that made it reports the error, memory keeps
-the correct state, and the next successful write of that session brings the file up to date.
+and rename it over the record. Records hold agents' replies and failure text, so the store keeps them private to the
+user whatever the umask is: the directories it creates are mode 0700, the lock and the records 0600, and the temporary
+file is created fresh each time rather than written through whatever was left at its path. The runtime is
+single-threaded and a write has no `.await` in it, so two writes can never interleave and no further coordination is
+needed. A send is accepted only once its record (the new turn in state `running` and its request ID) is on disk, before
+the agent is started and before the send returns; if that write fails, the send fails and nothing runs. If a later write
+fails, the call or turn that made it reports the error, memory keeps the correct state, and the next successful write of
+that session brings the file up to date.
 
 Removing a session deletes its record file after the agent's own data is gone, so a crash in between leaves a record
 whose agent data no longer exists. For Codex, removing it again then fails, since its delete command cannot tell
@@ -191,9 +194,10 @@ as MCP structured content and, for clients that ignore that, as the same JSON as
   from the agent's native transcript of the session's current conversation (`TRA-2`), one entry per line of the agent's
   own JSONL record, numbered from 0 in file order, always in ascending order. `limit` is 1 to 50 (default 20).
   - Without `from`, the read fills from the newest entry backwards, so the end of the transcript is always included and
-    reading it needs no knowledge of the length; to page back, pass `from` as the first returned index minus `limit`.
-    With `from`, it fills forwards from that entry. `next_from` is the index after the last entry returned, present when
-    more entries follow.
+    reading it needs no knowledge of the length. To page back, pass `from` as the first index already read minus
+    `limit`, clamped to 0, and follow `next_from` until reaching entries already read, because a page that hits the size
+    cap holds fewer than `limit` entries. With `from`, it fills forwards from that entry. `next_from` is the index after
+    the last entry returned, present when more entries follow.
   - `entry` is the line's JSON value, unchanged except that every string longer than 4 KiB is cut to 4 KiB and ends in
     ` [cut]`. If the entry is still larger than 64 KiB once serialized (a huge array, say), it is replaced by its
     serialized JSON cut to 64 KiB as a string, with `truncated: true`. A line that is not valid JSON is returned as a
@@ -494,8 +498,10 @@ can be rerun freely.
 
 `devbox-mcp set-key` reads the runtime key from stdin (never from the command line, where other processes can see it)
 and writes it, as `CONTROL_PLANE_API_KEY=<key>`, to `~/.config/devbox-mcp/tunnel.env`, readable only by the user, which
-the unit loads; the key appears nowhere else. The file is created afresh each time, never written through whatever was
-at its path, so a symlink or hardlink there cannot carry the key into another file.
+the unit loads; the key appears nowhere else. The new key goes to a fresh file next to it, created with mode 0600, which
+is then renamed over the old one: nothing is written through whatever was at the path, so a symlink or hardlink there
+cannot carry the key into another file, and a write that fails (a full disk, say) leaves the old key in place rather
+than none. Directories set-key and setup create are mode 0700 whatever the umask is.
 
 `devbox-mcp setup --tunnel-id <id>` never touches the key file and does two things:
 
@@ -507,11 +513,12 @@ at its path, so a symlink or hardlink there cannot carry the key into another fi
   user service's `PATH` is minimal and does not include the directories they usually live in. The profile directory is
   explicit, here and in the unit, so an `XDG_CONFIG_HOME` in the shell running setup cannot put the profile where the
   service does not look;
-- writes the unit, `~/.config/systemd/user/devbox-mcp.service`, from one fixed piece of text with the absolute paths
-  filled in, plus `Environment=PATH=` with the `PATH` setup runs with, so that the agents' commands find the user's
-  usual tools rather than only those on the systemd user manager's minimal `PATH`. Relative and empty entries (the
-  current directory, which a service must not depend on) and entries that would need escaping in a unit file are left
-  out; setup reports all but the empty ones.
+- writes the unit, `~/.config/systemd/user/devbox-mcp.service`, privately (mode 0600, replaced the same way as the key
+  file, since whoever can change it can change what the service runs), from one fixed piece of text with the absolute
+  paths filled in, plus `Environment=PATH=` with the `PATH` setup runs with, so that the agents' commands find the
+  user's usual tools rather than only those on the systemd user manager's minimal `PATH`. Relative and empty entries
+  (the current directory, which a service must not depend on) and entries that would need escaping in a unit file are
+  left out; setup reports all but the empty ones.
 
 It then prints the remaining commands (set the key if there is no key file yet, enable lingering, reload, enable and
 start the service) rather than running them. It does not pass on `tunnel-client init`'s own output unless init fails:

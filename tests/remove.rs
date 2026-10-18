@@ -307,6 +307,31 @@ async fn an_old_cursor_does_not_read_a_recreated_session() {
 ///
 /// This is the only test that waits out the real timeout; the kill and reap themselves are also unit-tested in
 /// `codex.rs` with a short one.
+/// Spec (SPEC_impl.md "Codex"): nothing `codex delete` started may keep running once the removal returns, or it could
+/// delete data after the session is back in use. Here the command exits successfully at once while a worker it started
+/// in its own process group is still running, the shape of an npm launcher whose deleting child outlives it. A
+/// regression: deletion used to wait for the launcher alone, report success, and leave the worker running.
+#[tokio::test]
+async fn removal_stops_what_codex_delete_left_running() {
+    let h = Harness::new();
+    let client = connect(&h).await;
+    create(&client, "alpha").await;
+    run_turn(&client, "alpha", "hello").await;
+    std::fs::write(h.fake_dir.join("delete-mode"), "worker").unwrap();
+    let removed = remove(&client, "alpha", false).await;
+    assert_eq!(removed["agent_data_deleted"], true);
+    let worker: i32 = std::fs::read_to_string(h.fake_dir.join("delete-worker"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        eventually(Duration::from_secs(5), || !process_running(worker)).await,
+        "the worker codex delete started is still running"
+    );
+    client.cancel().await.unwrap();
+}
+
 #[tokio::test]
 async fn a_removal_in_progress_blocks_new_work_until_it_ends() {
     let h = Harness::new();
