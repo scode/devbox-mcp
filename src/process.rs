@@ -69,37 +69,56 @@ fn set_parent_death_signal(cmd: &mut Command) {
 #[cfg(not(target_os = "linux"))]
 fn set_parent_death_signal(_cmd: &mut Command) {}
 
+/// How often [`exited`] checks whether the agent has exited.
+///
+/// The check is a non-blocking system call, so this only bounds how late an exit is noticed: up to this long, which is
+/// nothing next to a turn. See TODO.md for replacing the polling with an event-driven wait.
+const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 /// Waits until our child `pid` has exited, *without reaping it*.
 ///
 /// An exited but unreaped child is a zombie that still owns its PID and process group ID, so they can be signalled
 /// safely until the child is reaped (for example by `tokio::process::Child::wait`). That is the window
-/// [`TreeGuard::exited`] needs. The wait runs on a blocking thread; if the turn is abandoned first, the thread finishes
-/// as soon as the guard kills the child.
+/// [`TreeGuard::exited`] needs.
+///
+/// It checks with a non-blocking `waitid` every [`EXIT_POLL_INTERVAL`] rather than blocking in `waitid` on a thread of
+/// the runtime's blocking pool. A blocking wait held one pool thread for the whole life of every running turn, and
+/// cleanup after an interrupt needs a thread from the same pool, so with the pool full of watchers no interrupt could
+/// complete: the watchers waited for agents that only the queued cleanups would kill.
 #[cfg(target_os = "linux")]
 pub async fn exited(pid: u32) -> std::io::Result<()> {
-    tokio::task::spawn_blocking(move || {
-        loop {
-            // SAFETY: waitid writes only into `info`, which is a valid, zeroed siginfo_t.
-            let result = unsafe {
-                let mut info: libc::siginfo_t = std::mem::zeroed();
-                libc::waitid(
-                    libc::P_PID,
-                    pid as libc::id_t,
-                    &mut info,
-                    libc::WEXITED | libc::WNOWAIT,
-                )
-            };
-            if result == 0 {
-                return Ok(());
-            }
-            let err = std::io::Error::last_os_error();
-            if err.kind() != std::io::ErrorKind::Interrupted {
-                return Err(err);
-            }
+    loop {
+        if has_exited(pid)? {
+            return Ok(());
         }
-    })
-    .await
-    .map_err(std::io::Error::other)?
+        tokio::time::sleep(EXIT_POLL_INTERVAL).await;
+    }
+}
+
+/// One non-blocking check of whether our child `pid` has exited, leaving it unreaped.
+#[cfg(target_os = "linux")]
+fn has_exited(pid: u32) -> std::io::Result<bool> {
+    loop {
+        // SAFETY: waitid writes only into `info`, which is a valid, zeroed siginfo_t; si_pid then reads a field of it.
+        let (result, si_pid) = unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            let result = libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+            );
+            (result, info.si_pid())
+        };
+        if result == 0 {
+            // With WNOHANG, success with a zero si_pid means the child has not exited yet.
+            return Ok(si_pid != 0);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
 }
 
 /// Kills an agent and everything it started when dropped, unless disarmed first.
@@ -840,6 +859,46 @@ mod tests {
             ),
             "{ended:?}"
         );
+    }
+
+    /// Watching for an agent's exit must not hold a thread of the blocking pool for the whole run: interrupt cleanup
+    /// needs one, so with every thread held by a watcher waiting for an agent only the cleanup would kill, nothing
+    /// could ever be interrupted. A review reproduced that deadlock with this exact setup (a two-thread pool, three
+    /// hanging runs, all interrupted) when the watcher blocked in `waitid`.
+    #[test]
+    fn interrupts_complete_with_a_tiny_blocking_pool() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(2)
+            .build()
+            .unwrap();
+        let run = || {
+            run_agent(
+                AgentCommand {
+                    program: PathBuf::from("/bin/sh"),
+                    // Short-lived, so that if this test fails, the agents it could not stop die on their own.
+                    args: vec!["-c".into(), "sleep 30".into()],
+                    cwd: PathBuf::from("/"),
+                    stdin: Vec::new(),
+                },
+                |_| ControlFlow::Continue(()),
+                tokio::time::sleep(Duration::from_millis(300)),
+            )
+        };
+        let finished = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(20), async {
+                tokio::join!(run(), run(), run())
+            })
+            .await
+        });
+        // Dropping the runtime would wait for its blocking threads, which a regression leaves stuck; this test must fail
+        // then, not hang.
+        runtime.shutdown_background();
+        let (a, b, c) =
+            finished.expect("interrupts did not complete: the blocking pool is starved");
+        for ended in [a, b, c] {
+            assert!(matches!(ended.unwrap(), Ended::Stopped { .. }));
+        }
     }
 
     /// An agent that exits on its own is reported with its exit status and stderr.
