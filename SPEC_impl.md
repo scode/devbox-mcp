@@ -58,8 +58,11 @@ without them. `/proc/<pid>/stat` is parsed as bytes, since process names need no
 When the agent exits on its own, the turn ends at its exit rather than when its output pipes close, which a leftover
 background process could keep open forever. The exit is noticed with `waitid(WNOWAIT)`, which leaves the agent unreaped,
 so its process group ID still belongs to it while the guard kills what is left in that group; only then is the agent
-reaped. Reading the pipes stops after a two-second grace period. (A pidfd would avoid the blocking thread `waitid`
-needs, but polling one asynchronously requires tokio's `net` feature, which also compiles in TCP listeners.)
+reaped. Reading the pipes stops after a two-second grace period. The `waitid` is non-blocking (`WNOHANG`) and repeated
+every 50 ms on the async runtime, which notices an exit up to 50 ms late. A blocking `waitid` would hold a thread of the
+runtime's blocking pool for the whole turn, and interrupt cleanup needs a thread from the same pool, so with enough
+running turns no interrupt could complete. (A pidfd would make the wait event-driven, but polling one asynchronously
+requires tokio's `net` feature, which also compiles in TCP listeners.)
 
 On Linux the child also gets a parent-death signal, so it is killed if devbox-mcp dies abruptly; it checks after setting
 the signal that devbox-mcp did not die in the meantime. The kernel ties that signal to the thread that spawned the

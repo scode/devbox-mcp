@@ -74,3 +74,11 @@ service with `Delegate=yes`), so it also affects how devbox-mcp is deployed.
 exited, while its last output is collected and anything it left running is stopped (SPEC_impl.md, "Tools"). Tracking the
 exit separately would make it exact, but it would need a new signal passed from the process runner through the agent
 adapter into the session table, and a caller would not act any differently on the more precise value.
+
+### Event-driven exit watching
+
+The process runner notices an agent's exit by polling a non-blocking `waitid` every 50 ms (SPEC_impl.md, "Process
+model"), which costs a wakeup per running turn every 50 ms and notices an exit up to 50 ms late. A pidfd would make the
+wait event-driven. It is not near term because nothing suffers from the polling at today's scale, and waiting on a pidfd
+asynchronously with tokio needs its `net` feature, which also compiles in TCP listeners; doing it without that feature
+means a hand-written poll loop or a dedicated thread, which is the kind of blocking the polling replaced.
