@@ -232,6 +232,46 @@ async fn running_setup_again_replaces_its_files_but_not_the_key() {
     assert_eq!(home.config(KEY_FILE), "CONTROL_PLANE_API_KEY=the-key\n");
 }
 
+/// Spec (SPEC_impl.md "Deployment"): a unit directory left open to others from before is made private when setup runs,
+/// since whoever can write to it can change what the service runs; a loose `~/.config` above it is shared with other
+/// programs, so setup only warns about it.
+#[tokio::test]
+async fn setup_tightens_a_loose_unit_directory() {
+    let home = Home::new();
+    assert!(home.set_key("sk-test-key").await.status.success());
+    let config = home.path().join(".config");
+    std::fs::create_dir_all(config.join("systemd/user")).unwrap();
+    for dir in ["", "systemd", "systemd/user"] {
+        std::fs::set_permissions(config.join(dir), std::fs::Permissions::from_mode(0o775)).unwrap();
+    }
+
+    let output = home.setup(TUNNEL_ID).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(home.mode("systemd/user"), 0o700);
+    assert_eq!(
+        home.mode("systemd"),
+        0o775,
+        "a shared directory must be left alone"
+    );
+    assert_eq!(
+        home.mode(""),
+        0o775,
+        "a shared directory must be left alone"
+    );
+    let err = stderr(&output);
+    assert!(
+        err.contains(&format!("warning: {} is writable", config.display())),
+        "{err}"
+    );
+    assert!(
+        err.contains(&format!(
+            "warning: {} is writable",
+            config.join("systemd").display()
+        )),
+        "{err}"
+    );
+}
+
 /// Spec (SPEC_impl.md "Deployment"): set-key replaces an earlier key, and re-restricts a key file whose permissions
 /// were loosened in the meantime.
 #[tokio::test]

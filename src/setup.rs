@@ -167,9 +167,11 @@ pub fn run(args: SetupArgs) -> anyhow::Result<()> {
         );
     }
 
-    // Whoever can change the unit can change what the service runs, so it is written like the key: privately, and
-    // into directories that, when setup creates them, only the user can enter.
-    create_dirs(&unit_dir)?;
+    // Whoever can change the unit can change what the service runs, so it is written like the key: privately, into a
+    // directory only the user can enter, even one left loose from before. The shared directories above it are only
+    // warned about (`perms`).
+    create_private_dir(&unit_dir)?;
+    crate::perms::warn_loose_ancestors(&unit_dir);
     let unit = unit_dir.join(UNIT_NAME);
     write_private(
         &unit,

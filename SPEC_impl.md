@@ -118,7 +118,12 @@ Each session is one JSON file, `<state-dir>/sessions/<name>.json`. It holds:
 Every change rewrites the whole record synchronously: write a temporary file with a fixed name next to it, `fsync` it,
 and rename it over the record. Records hold agents' replies and failure text, so the store keeps them private to the
 user whatever the umask is: the directories it creates are mode 0700, the lock and the records 0600, and the temporary
-file is created fresh each time rather than written through whatever was left at its path. The runtime is
+file is created fresh each time rather than written through whatever was left at its path. State from before that, or
+loosened by hand, is tightened at every start: the state and sessions directories to 0700 (failing to start if that is
+not possible, say because another user owns them), the lock and each record to 0600 through a descriptor opened without
+following symlinks (a record that cannot be tightened is warned about and otherwise handled as usual). Directories above
+the state directory that the user owns and others can write to are warned about on stderr, never changed, since other
+programs share them; root-owned ones such as `/` and `/tmp` are not the user's to fix and are skipped. The runtime is
 single-threaded and a write has no `.await` in it, so two writes can never interleave and no further coordination is
 needed. A send is accepted only once its record (the new turn in state `running` and its request ID) is on disk, before
 the agent is started and before the send returns; if that write fails, the send fails and nothing runs. If a later write
@@ -507,7 +512,9 @@ and writes it, as `CONTROL_PLANE_API_KEY=<key>`, to `~/.config/devbox-mcp/tunnel
 the unit loads; the key appears nowhere else. The new key goes to a fresh file next to it, created with mode 0600, which
 is then renamed over the old one: nothing is written through whatever was at the path, so a symlink or hardlink there
 cannot carry the key into another file, and a write that fails (a full disk, say) leaves the old key in place rather
-than none. Directories set-key and setup create are mode 0700 whatever the umask is.
+than none. Directories set-key and setup create are mode 0700 whatever the umask is. Setup also makes an existing unit
+directory (`~/.config/systemd/user`) private, since whoever can write to it can change what the service runs, and warns,
+the same way as for the state directory, about directories above it that the user owns and others can write to.
 
 `devbox-mcp setup --tunnel-id <id>` never touches the key file and does two things:
 
